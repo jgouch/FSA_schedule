@@ -312,9 +312,9 @@ class Scheduler:
         # weekly cap outside push week
         wk = week_start_sun(d)
         add_h = hours_for(d, role, inp)
-        if d not in self.push_days:
-            if self.week_hours[wk][person] + add_h > inp.weekly_cap_hours:
-                return False, "weekly_cap"
+        week_contains_push = any((wk + timedelta(days=i)) in self.push_days for i in range(7))
+        if (not week_contains_push) and self.week_hours[wk][person] + add_h > inp.weekly_cap_hours:
+            return False, "weekly_cap"
 
         return True, "ok"
 
@@ -398,7 +398,13 @@ class Scheduler:
                 if "AN" not in self.sched[sat]:
                     self.assign(sat, "AN", p)
 
-    def pick_candidate(self, d: date, role: str, targets: Dict[str, Dict[str, int]]) -> Optional[str]:
+    def pick_candidate(
+        self,
+        d: date,
+        role: str,
+        targets: Dict[str, Dict[str, int]],
+        fairness_role: Optional[str] = None,
+    ) -> Optional[str]:
         fsas = self.inp.fsas
         cands = []
         for p in fsas:
@@ -410,10 +416,11 @@ class Scheduler:
 
         def score(p: str) -> float:
             s = 0.0
+            target_role = fairness_role or role
 
             # fairness pressure for PN/AN/W
-            if role in targets:
-                need = targets[role][p] - self.role_counts[role][p]
+            if target_role in targets:
+                need = targets[target_role][p] - self.role_counts[target_role][p]
                 s += 6.0 * need
 
             # avoid repeated weekday PN (soft)
@@ -458,7 +465,12 @@ class Scheduler:
         for r in required:
             if r in self.sched[d]:
                 continue
-            cand = self.pick_candidate(d, "BU", {"BU": {p: 9999 for p in self.inp.fsas}})
+            cand = self.pick_candidate(
+                d,
+                r,
+                {"BU": {p: 9999 for p in self.inp.fsas}},
+                fairness_role="BU",
+            )
             if cand is None:
                 return False
             self.assign(d, r, cand)
