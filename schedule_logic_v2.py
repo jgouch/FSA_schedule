@@ -276,6 +276,13 @@ class Solver:
                 cur -= timedelta(days=1)
             else:
                 break
+        cur = d + timedelta(days=1)
+        while cur.month == d.month:
+            if p in self.sched[cur].values():
+                streak += 1
+                cur += timedelta(days=1)
+            else:
+                break
         return streak
 
     def can_assign(self, p: str, d: date, role: str) -> Tuple[bool, str]:
@@ -294,9 +301,9 @@ class Solver:
 
         wk = week_start_sun(d)
         add_h = hours_for(d, role, inp)
-        if d not in self.push_days:
-            if self.week_hours[wk][p] + add_h > inp.weekly_cap_hours:
-                return False, "weekly_cap"
+        week_contains_push = any((wk + timedelta(days=i)) in self.push_days for i in range(7))
+        if (not week_contains_push) and self.week_hours[wk][p] + add_h > inp.weekly_cap_hours:
+            return False, "weekly_cap"
         return True, "ok"
 
     def assign(self, d: date, role: str, p: str):
