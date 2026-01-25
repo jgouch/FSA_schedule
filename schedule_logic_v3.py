@@ -201,6 +201,7 @@ class Solver:
         if inp.push_week_enabled:
             self.push_days.update(last_weekdays_block(inp.year, inp.month))
             self.push_days.add(max(d for d in self.days if is_saturday(d)))
+        self.weeks_with_push = {week_start_sun(d) for d in self.push_days}
 
         self.sched: Dict[date, Dict[str, str]] = {d: {} for d in self.days}
         self.week_hours: Dict[date, Counter] = defaultdict(Counter)
@@ -212,6 +213,8 @@ class Solver:
 
     def compute_targets(self) -> Dict[str, Dict[str, int]]:
         fsas = self.inp.fsas
+        if not fsas:
+            raise ValueError("Inputs.fsas must include at least one FSA.")
         hier = sort_by_hierarchy(fsas, self.inp.sales_volume, self.inp.seniority_order)
 
         pn_slots = an_slots = w_slots = 0
@@ -254,10 +257,16 @@ class Solver:
             return False, "monday_pn_limit"
         if self.consecutive_streak_if_work(p, d) > self.inp.max_consecutive_days:
             return False, "max_consecutive_days"
+        if role == "AN" and is_saturday(d):
+            sunday = d + timedelta(days=1)
+            sunday_pn = self.sched.get(sunday, {}).get("PN")
+            if sunday_pn and p != sunday_pn:
+                return False, "saturday_an_reserved_for_sunday_pn"
 
         wk = week_start_sun(d)
         add_h = hours_for(d, role, self.inp)
-        if d not in self.push_days and self.week_hours[wk][p] + add_h > self.inp.weekly_cap_hours:
+        week_contains_push = wk in self.weeks_with_push
+        if (not week_contains_push) and self.week_hours[wk][p] + add_h > self.inp.weekly_cap_hours:
             return False, "weekly_cap"
         return True, "ok"
 
@@ -287,20 +296,31 @@ class Solver:
 
     def set_sundays_by_rotation(self):
         order = self.inp.sunday_rotation_order
+        if not order:
+            raise ValueError("Inputs.sunday_rotation_order must include at least one FSA.")
+        if self.inp.sunday_first_assignee not in order:
+            raise ValueError("Inputs.sunday_first_assignee must be in sunday_rotation_order.")
+        order_len = len(order)
         idx = order.index(self.inp.sunday_first_assignee)
         sundays = [d for d in self.days if is_sunday(d) and d not in self.inp.observed_holidays]
         for d in sundays:
             chosen = None
-            for k in range(6):
-                cand = order[(idx + k) % 6]
+            for k in range(order_len):
+                cand = order[(idx + k) % order_len]
                 ok, _ = self.can_assign(cand, d, "PN")
+                if ok:
+                    sat = d - timedelta(days=1)
+                    if sat.month == self.inp.month and sat not in self.inp.observed_holidays:
+                        req_sat = roles_for_day(sat, self.inp, self.push_days)
+                        if "AN" in req_sat:
+                            ok, _ = self.can_assign(cand, sat, "AN")
                 if ok:
                     chosen = cand
                     break
             if chosen is None:
                 raise RuntimeError(f"Could not assign Sunday PN on {d}.")
             self.assign(d, "PN", chosen)
-            idx = (order.index(chosen) + 1) % 6
+            idx = (order.index(chosen) + 1) % order_len
 
     def enforce_sat_an_for_sun(self):
         for d in self.days:
@@ -320,7 +340,7 @@ class Solver:
                         raise RuntimeError(f"Cannot enforce Sat AN for Sun PN: {p} on {sat} ({reason}).")
                     self.assign(sat, "AN", p)
 
-    def candidate_list(self, d: date, role: str) -> List[str]:
+    def candidate_list(self, d: date, role: str, shuffle: bool = True) -> List[str]:
         cands = []
         for p in self.inp.fsas:
             ok, _ = self.can_assign(p, d, role)
@@ -333,10 +353,13 @@ class Solver:
             if role in self.targets:
                 return self.targets[role][p] - self.role_counts[role][p]
             return 0
-        cands.sort(key=lambda p: (need(p), -hier_rank.get(p, 999), self.rng.random()), reverse=True)
-        top = cands[: min(4, len(cands))]
-        self.rng.shuffle(top)
-        return top + cands[min(4, len(cands)) :]
+        if shuffle:
+            cands.sort(key=lambda p: (need(p), -hier_rank.get(p, 999), self.rng.random()), reverse=True)
+            top = cands[: min(4, len(cands))]
+            self.rng.shuffle(top)
+            return top + cands[min(4, len(cands)) :]
+        cands.sort(key=lambda p: (need(p), -hier_rank.get(p, 999)), reverse=True)
+        return cands
 
     def next_unfilled_slot(self) -> Optional[Tuple[date, str]]:
         best = None
@@ -349,7 +372,7 @@ class Solver:
             for role in ordered:
                 if role in self.sched[d]:
                     continue
-                n = len(self.candidate_list(d, role))
+                n = len(self.candidate_list(d, role, shuffle=False))
                 if n == 0:
                     return (d, role)
                 if n < best_len:
