@@ -4,21 +4,47 @@ import json
 import re
 from datetime import date
 from pathlib import Path
-from typing import Dict, Tuple, List
+from typing import Tuple
 import openpyxl
 
 def parse_month_year(s: str) -> Tuple[int, int]:
     s = str(s).strip()
-    m = re.search(r"([A-Za-z]+)\s+(\d{4})", s)
+    m = re.search(r"([A-Za-z.]+)\s+(\d{4})", s)
     if not m:
         raise ValueError(f"Cannot parse month/year from '{s}'")
-    month_name = m.group(1).lower()
+    month_name = m.group(1).lower().rstrip(".")
     year = int(m.group(2))
     months = {
-        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-        "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
+        "january": 1, "jan": 1,
+        "february": 2, "feb": 2,
+        "march": 3, "mar": 3,
+        "april": 4, "apr": 4,
+        "may": 5,
+        "june": 6, "jun": 6,
+        "july": 7, "jul": 7,
+        "august": 8, "aug": 8,
+        "september": 9, "sep": 9, "sept": 9,
+        "october": 10, "oct": 10,
+        "november": 11, "nov": 11,
+        "december": 12, "dec": 12,
     }
+    if month_name not in months:
+        raise ValueError(f"Unrecognized month name '{month_name}' in '{s}'")
     return year, months[month_name]
+
+
+def parse_day(value) -> int | None:
+    if isinstance(value, int):
+        return value if 1 <= value <= 31 else None
+    if isinstance(value, float) and value.is_integer():
+        day = int(value)
+        return day if 1 <= day <= 31 else None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            day = int(stripped)
+            return day if 1 <= day <= 31 else None
+    return None
 
 def export_template(path_in: str):
     wb = openpyxl.load_workbook(path_in, data_only=True)
@@ -30,8 +56,9 @@ def export_template(path_in: str):
     date_cells = []
     for row in ws.iter_rows():
         for cell in row:
-            if isinstance(cell.value, int) and 1 <= cell.value <= 31:
-                date_cells.append((cell.row, cell.column, cell.value))
+            daynum = parse_day(cell.value)
+            if daynum is not None:
+                date_cells.append((cell.row, cell.column, daynum))
 
     schedule = {}
     for r, c, daynum in date_cells:
@@ -41,9 +68,16 @@ def export_template(path_in: str):
         roles = {}
 
         last_primary_row = r
-        for rr in range(r + 1, r + 8):
+        empty_primary = 0
+        for rr in range(r + 1, r + 20):
             label = ws.cell(rr, label_col).value
             name = ws.cell(rr, name_col).value
+            if not label and not name:
+                empty_primary += 1
+                if empty_primary >= 3:
+                    break
+                continue
+            empty_primary = 0
             if not label or not name:
                 continue
             label = str(label).strip().upper()
@@ -59,11 +93,17 @@ def export_template(path_in: str):
                 last_primary_row = rr
 
         bu_idx = 1
-        for rr in range(last_primary_row + 1, r + 12):
+        empty_bu = 0
+        for rr in range(last_primary_row + 1, r + 30):
             name = ws.cell(rr, name_col).value
-            if name:
-                roles[f"BU{bu_idx}"] = str(name).strip()
-                bu_idx += 1
+            if not name:
+                empty_bu += 1
+                if empty_bu >= 3:
+                    break
+                continue
+            empty_bu = 0
+            roles[f"BU{bu_idx}"] = str(name).strip()
+            bu_idx += 1
 
         if roles:
             schedule[d] = roles
