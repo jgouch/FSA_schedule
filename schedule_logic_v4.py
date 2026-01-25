@@ -5,7 +5,8 @@ Logic-first scheduler for Harpeth Hills FSAs (NO Excel formatting yet).
 
 Fixes vs v3 (per Codex review):
 1) Weekly cap rule aligned with validation:
-   - Cap is waived for ANY week (Sun–Sat) that contains a push day.
+   - Cap is waived for ANY week (Sun–Sat) that contains a push day,
+     including push days that fall in adjacent months.
 2) Sunday rotation generalized:
    - Uses len(rotation_order) not hard-coded 6; validates against fsas set.
 3) Saturday AN-before-Sunday-PN constraint integrated into backtracking:
@@ -91,16 +92,22 @@ def hours_for(d: date, role: str, inp: Inputs) -> int:
     return inp.hours_per_day
 
 
-def compute_push_days(inp: Inputs) -> Set[date]:
-    days = month_days(inp.year, inp.month)
-    if not inp.push_week_enabled:
+def push_days_for_month(year: int, month: int, enabled: bool) -> Set[date]:
+    if not enabled:
         return set()
-    push = set(last_weekdays_block(inp.year, inp.month))
+    days = month_days(year, month)
+    push = set(last_weekdays_block(year, month))
     push.add(max(d for d in days if is_saturday(d)))
     return push
 
-def week_contains_push(wk_start: date, push_days: Set[date]) -> bool:
-    return any((wk_start + timedelta(days=i)) in push_days for i in range(7))
+def compute_push_days(inp: Inputs) -> Set[date]:
+    return push_days_for_month(inp.year, inp.month, inp.push_week_enabled)
+
+def is_push_day(d: date, inp: Inputs) -> bool:
+    return d in push_days_for_month(d.year, d.month, inp.push_week_enabled)
+
+def week_contains_push(wk_start: date, inp: Inputs) -> bool:
+    return any(is_push_day(wk_start + timedelta(days=i), inp) for i in range(7))
 
 def available_fsas_on(d: date, inp: Inputs) -> List[str]:
     return [p for p in inp.fsas if d not in inp.time_off.get(p, set())]
@@ -219,7 +226,7 @@ def validate_schedule(sched: Dict[date, Dict[str, str]], inp: Inputs) -> List[Di
             week_hours[wk][p] += hours_for(d, role, inp)
 
     for wk, ctr in week_hours.items():
-        waive = week_contains_push(wk, push_days)
+        waive = week_contains_push(wk, inp)
         for p, h in ctr.items():
             if (not waive) and h > inp.weekly_cap_hours:
                 add("HARD", f"Weekly hours exceed cap ({h}).", d=wk, who=p)
@@ -318,7 +325,7 @@ class Solver:
                     return False, "sat_an_must_match_sunday_pn"
 
         wk = week_start_sun(d)
-        waive = week_contains_push(wk, self.push_days)
+        waive = week_contains_push(wk, inp)
         add_h = hours_for(d, role, inp)
         if (not waive) and (self.week_hours[wk][p] + add_h > inp.weekly_cap_hours):
             return False, "weekly_cap"
