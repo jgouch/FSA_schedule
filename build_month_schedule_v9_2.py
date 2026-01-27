@@ -769,6 +769,25 @@ def build_schedule(config: BuildConfig,
                     return rr
         return None
 
+
+    def role_on_day(name: str, dd: date) -> Optional[str]:
+
+        """Return the role this person worked on a specific date (dd), or None."""
+
+        if dd.month == month:
+
+            roles = schedule.get(dd.isoformat(), {})
+
+            for rr, nn in roles.items():
+
+                if nn == name:
+
+                    return rr
+
+            return None
+
+        return role_of(prev_sched, dd, name)
+
     def consecutive_streak(name: str, d: date) -> int:
         streak = 0
         for k in range(1, config.lookback_days + 1):
@@ -820,8 +839,8 @@ def build_schedule(config: BuildConfig,
             return False
         if name in schedule[d.isoformat()].values():
             return False
-        prev_role = last_role(name, d)
-        if prev_role == role:
+        prev_day_role = role_on_day(name, d - timedelta(days=1))
+        if prev_day_role == role:
             return False
         if consecutive_streak(name, d) >= config.max_consecutive_days:
             return False
@@ -887,8 +906,8 @@ def build_schedule(config: BuildConfig,
         if name in cons.hard_off.get(d, set()): return False
         if name in cons.avoid_roles.get((d, role), set()): return False
         if name in schedule[d.isoformat()].values(): return False
-        prev_role = last_role(name, d)
-        if prev_role == role: return False
+        prev_day_role = role_on_day(name, d - timedelta(days=1))
+        if prev_day_role == role: return False
         if consecutive_streak(name, d) >= config.max_consecutive_days: return False
         if would_exceed_week_cap(d, role, name): return False
         if would_exceed_week_days_cap(d, name): return False
@@ -964,6 +983,7 @@ def build_schedule(config: BuildConfig,
             return True
         idx, slot, cands = select_next_slot(slots_left)
         if not cands:
+            last_fail_slot = slot
             return False
         d, role = slot
         for name in cands:
@@ -1041,8 +1061,8 @@ def build_schedule(config: BuildConfig,
         if name in cons.hard_off.get(d, set()): return False
         if name in cons.avoid_roles.get((d, role), set()): return False
         if name in schedule[d.isoformat()].values(): return False
-        prev_role = last_role(name, d)
-        if prev_role == role: return False
+        prev_day_role = role_on_day(name, d - timedelta(days=1))
+        if prev_day_role == role: return False
         if consecutive_streak(name, d) >= config.max_consecutive_days: return False
         if would_exceed_week_cap(d, role, name): return False
         if would_exceed_week_days_cap(d, name): return False
@@ -1082,7 +1102,10 @@ def build_schedule(config: BuildConfig,
             return True
         idx, slot, cands = select_next_slot_bu(slots_left)
         if not cands:
-            return False
+            last_fail_slot_bu = slot
+            # best effort: skip this BU slot and continue
+            nxt = slots_left[:idx] + slots_left[idx+1:]
+            return solve_bu(nxt)
         d, role = slot
         for name in cands:
             nodes2 += 1
@@ -1442,4 +1465,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-}
