@@ -583,7 +583,7 @@ def build_schedule(config: BuildConfig,
             day_hours = 0
             for rr, nn in roles.items():
                 if nn == name:
-                    day_hours = max(day_hours, hours_for_role(dd, rr, observed_holidays))
+                    day_hours = max(day_hours, hours_for_role(dd, rr, observed_holidays_for_year(dd.year)))
             total += day_hours
         return total
 
@@ -608,7 +608,6 @@ def build_schedule(config: BuildConfig,
                 pn = roles.get("PN")
                 if pn in roster:
                     return pn
-                return None
         return None
 
     sunday_assignees = {}
@@ -1084,7 +1083,7 @@ def export_schedule_to_excel(schedule: Dict[str, Dict[str, str]],
     week_starts = sorted({week_start_sun(d) for d in month_days(year, month)})
 
     def hours_on_day(dd: date, person: str) -> int:
-        if dd in observed_holidays:
+        if dd in observed_holidays_for_year(dd.year):
             return 0
         if dd.month == month and dd.year == year:
             roles = schedule.get(dd.isoformat(), {})
@@ -1095,7 +1094,7 @@ def export_schedule_to_excel(schedule: Dict[str, Dict[str, str]],
         day_hours = 0
         for rr, nn in roles.items():
             if nn == person:
-                day_hours = max(day_hours, hours_for_role(dd, rr, observed_holidays))
+                day_hours = max(day_hours, hours_for_role(dd, rr, observed_holidays_for_year(dd.year)))
         return day_hours
 
     red_fill = PatternFill("solid", fgColor="FFC7CE")
@@ -1176,6 +1175,7 @@ def main():
         out_xlsx,
         roster,
         observed_holidays_for_year(year),
+        prev,
     )
     print(f"✅ Wrote schedule Excel → {out_xlsx}")
 
