@@ -921,6 +921,8 @@ def build_schedule(config: BuildConfig,
         prev_role = last_role(name, d)
         if prev_role == role:
             return False
+        if role == "PN" and weekday_sun0(d) == 1 and monday_pn_used[name] >= 1:
+            return False
         if consecutive_streak(name, d) >= config.max_consecutive_days:
             return False
         if would_exceed_week_cap(d, role, name):
@@ -1125,6 +1127,7 @@ def export_schedule_to_excel(schedule: Dict[str, Dict[str, str]],
     roster: List[str],
     observed_holidays: Set[date],
     prev_sched: Optional[Dict[str, Dict[str, str]]] = None,
+    payperiods: Optional[List[Tuple[date, date]]] = None,
     title: Optional[str] = None):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1447,6 +1450,7 @@ def main():
         roster,
         observed_holidays_for_year(year),
         prev,
+        payperiods,
     )
     print(f"✅ Wrote schedule Excel → {out_xlsx}")
 
