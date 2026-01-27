@@ -46,6 +46,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.datetime import from_excel
 
 
 # ----------------------------
@@ -185,6 +186,11 @@ def parse_excel_date(value) -> date:
         return value.date()
     if isinstance(value, date):
         return value
+    if isinstance(value, (int, float)):
+        try:
+            return from_excel(value).date()
+        except Exception as exc:
+            raise ValueError(f"Unrecognized date format: {value!r}") from exc
     s = str(value).strip()
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
         try:
@@ -373,7 +379,7 @@ def load_sales_ranking_from_timeoff_xlsx(
             continue
         period = str(period).strip()
         ranks = []
-        for c in range(2, 8):  # B..G
+        for c in range(2, ws.max_column + 1):
             v = ws.cell(r, c).value
             if v is None or str(v).strip() == "":
                 continue
@@ -580,6 +586,14 @@ def build_schedule(config: BuildConfig,
     rng = random.Random(config.rng_seed)
     year, month = config.year, config.month
     days = month_days(year, month)
+    if payperiods:
+        last_day = date(year, month, calendar.monthrange(year, month)[1])
+        for s, e in payperiods:
+            if e > last_day:
+                raise ValueError(
+                    f"Pay period end {e.isoformat()} exceeds month end {last_day.isoformat()}. "
+                    "Provide pay periods that end within the target month."
+                )
     
     # Pre-calculate holidays for the target year once
     observed_holidays = observed_holidays_for_year(year)
@@ -589,7 +603,11 @@ def build_schedule(config: BuildConfig,
         return any((week_start + timedelta(days=i)) in push_days for i in range(7))
     
     def week_contains_holiday(week_start: date) -> bool:
-        return any((week_start + timedelta(days=i)) in observed_holidays for i in range(7))
+        for i in range(7):
+            dd = week_start + timedelta(days=i)
+            if dd in observed_holidays_for_year(dd.year):
+                return True
+        return False
 
     def hours_for_any_role_on_day(dd: date, roles_map: Dict[str, Dict[str, str]], name: str) -> int:
         day_hours = 0
