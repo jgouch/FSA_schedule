@@ -147,7 +147,7 @@ class ExportConfig:
 PRIMARY_LABELS = {"PN", "AN", "W", "PH"}  # W only in your world, but keep PH safe if appears
 BU_PREFIX = "BU"
 
-def looks_like_day_block(ws, r: int, c: int, max_scan: int) -> bool:
+def looks_like_day_block(ws, r: int, c: int, cfg: ExportConfig) -> bool:
     """
     Heuristic: below the day cell, we should see:
     - at least one primary label like "PN" or "AN" or "W"
@@ -157,9 +157,9 @@ def looks_like_day_block(ws, r: int, c: int, max_scan: int) -> bool:
     """
     labels_found = 0
     names_found = 0
-    for rr in range(r + 1, min(r + 1 + max_scan, ws.max_row + 1)):
-        label = ws.cell(rr, c).value
-        name = ws.cell(rr, c + 1).value
+    for rr in range(r + 1, min(r + 1 + cfg.max_scan, ws.max_row + 1)):
+        label = ws.cell(rr, c + cfg.label_col_offset).value
+        name = ws.cell(rr, c + cfg.name_col_offset).value
         if isinstance(label, str):
             t = label.strip().upper().replace(":", "")
             # match "PN -" or "PN"
@@ -197,7 +197,7 @@ def find_day_cells(ws, year: int, month: int, cfg: ExportConfig) -> List[Tuple[d
                     continue
 
             # ensure it is actually a day block
-            if not looks_like_day_block(ws, r, c, cfg.max_scan):
+            if not looks_like_day_block(ws, r, c, cfg):
                 continue
 
             if daynum in found:
@@ -229,7 +229,7 @@ def parse_roles_for_day(ws, anchor_r: int, anchor_c: int, cfg: ExportConfig, nex
     roles: Dict[str, str] = {}
     start = anchor_r + 1
     end_limit = min(ws.max_row, anchor_r + cfg.max_scan)
-    if next_anchor_row is not None:
+    if next_anchor_row is not None and next_anchor_row > anchor_r:
         end_limit = min(end_limit, next_anchor_row - 1)
 
     # First pass: read primary labeled rows
