@@ -69,14 +69,16 @@ MAX_WEEKS = 5
 ROLE_PRIMARY = ["PN", "AN", "W"]
 ROLE_BUS = ["BU1", "BU2", "BU3", "BU4"]
 
-# Park Lawn observed holidays for 2026 (no roles on observed date)
-OBSERVED_HOLIDAYS_2026 = {
-    date(2026, 1, 1),   # New Year's Day
-    date(2026, 5, 25),  # Memorial Day
-    date(2026, 7, 3),   # Independence Day observed
-    date(2026, 9, 7),   # Labor Day
-    date(2026, 11, 26), # Thanksgiving
-    date(2026, 12, 25), # Christmas
+# Park Lawn observed holidays (no roles on observed date)
+OBSERVED_HOLIDAYS_BY_YEAR = {
+    2026: {
+        date(2026, 1, 1),   # New Year's Day
+        date(2026, 5, 25),  # Memorial Day
+        date(2026, 7, 3),   # Independence Day observed
+        date(2026, 9, 7),   # Labor Day
+        date(2026, 11, 26), # Thanksgiving
+        date(2026, 12, 25), # Christmas
+    }
 }
 
 # Default roster (display names used in Excel). You can expand later.
@@ -137,6 +139,22 @@ def parse_month_arg(s: str) -> Tuple[int, int]:
         raise ValueError("Month must be YYYY-MM, e.g. 2026-02")
     return int(m.group(1)), int(m.group(2))
 
+def observed_holidays_for_year(year: int) -> Set[date]:
+    return OBSERVED_HOLIDAYS_BY_YEAR.get(year, set())
+
+def parse_excel_date(value) -> date:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized date format: {value!r}")
+
 
 # ----------------------------
 # Inputs from Excel (TimeOff.xlsx)
@@ -190,17 +208,7 @@ def load_timeoff_from_xlsx(xlsx_path: str, sheet_name: str) -> List[TimeOffRule]
             continue
 
         # date parse
-        if isinstance(dv, datetime):
-            dd = dv.date()
-        elif isinstance(dv, date):
-            dd = dv
-        else:
-            s = str(dv).strip()
-            try:
-                dd = datetime.strptime(s, "%Y-%m-%d").date()
-            except Exception:
-                # allow M/D/YYYY
-                dd = datetime.strptime(s, "%m/%d/%Y").date()
+        dd = parse_excel_date(dv)
 
         name = norm_name(nv)
 
@@ -317,7 +325,9 @@ def worked_prev(prev: Dict[str, Dict[str, str]], d: date, name: str) -> bool:
 # Scheduling rules
 # ----------------------------
 
-def roles_required_for_day(d: date, push_week_days: Set[date]) -> List[str]:
+def roles_required_for_day(d: date,
+                           push_week_days: Set[date],
+                           observed_holidays: Set[date]) -> List[str]:
     """
     Per your rules:
     - No roles on observed holidays.
@@ -326,7 +336,7 @@ def roles_required_for_day(d: date, push_week_days: Set[date]) -> List[str]:
     - Friday: PN, AN, W + BU1/BU2 (and BU3 if push week / all hands)
     - Saturday: PN, AN + BU1/BU2 normally; push-week Saturday has BU3 + BU4 (no W)
     """
-    if d in OBSERVED_HOLIDAYS_2026:
+    if d in observed_holidays:
         return []
 
     if is_sunday(d):
@@ -359,8 +369,8 @@ def roles_required_for_day(d: date, push_week_days: Set[date]) -> List[str]:
     # Ensure order: primaries first then BUs
     return req
 
-def hours_for_role(d: date, role: str) -> int:
-    if d in OBSERVED_HOLIDAYS_2026:
+def hours_for_role(d: date, role: str, observed_holidays: Set[date]) -> int:
+    if d in observed_holidays:
         return 0
     if is_sunday(d) and role == "PN":
         return 5
@@ -368,20 +378,6 @@ def hours_for_role(d: date, role: str) -> int:
 
 def week_start_sun(d: date) -> date:
     return d - timedelta(days=weekday_sun0(d))
-
-def in_push_week(d: date, year: int, month: int) -> bool:
-    """Push week = last Monday-Friday of the month. Plus last Saturday (same week)."""
-    # Determine last day of month
-    last_dom = calendar.monthrange(year, month)[1]
-    last = date(year, month, last_dom)
-    # Find last Friday of month
-    cur = last
-    while cur.weekday() != 4:  # Friday
-        cur -= timedelta(days=1)
-    last_friday = cur
-    last_monday = last_friday - timedelta(days=4)
-    # push week days: Mon..Fri plus Saturday immediately after Friday if in-month
-    return last_monday <= d <= last_friday
 
 def push_days_for_month(year: int, month: int) -> Set[date]:
     days = set()
@@ -432,7 +428,11 @@ def compile_constraints(timeoff: List[TimeOffRule]) -> Constraints:
                 avoid_roles.setdefault((r.d, role.upper()), set()).add(r.name)
     return Constraints(hard_off=hard_off, avoid_roles=avoid_roles)
 
-def compute_primary_targets(days: List[date], push_days: Set[date]) -> Dict[str, Dict[str, int]]:
+def compute_primary_targets(days: List[date],
+                            push_days: Set[date],
+                            roster: List[str],
+                            sales_order: List[str],
+                            observed_holidays: Set[date]) -> Dict[str, Dict[str, int]]:
     """
     Targets for PN/AN/W across the month (roughly even).
     Returns targets[role][name] = target_count
@@ -440,22 +440,22 @@ def compute_primary_targets(days: List[date], push_days: Set[date]) -> Dict[str,
     # count opportunities for each primary role required
     opp = {"PN": 0, "AN": 0, "W": 0}
     for d in days:
-        req = roles_required_for_day(d, push_days)
+        req = roles_required_for_day(d, push_days, observed_holidays)
         for role in ("PN", "AN", "W"):
             if role in req:
                 opp[role] += 1
 
-    n = len(DEFAULT_ROSTER)  # 6
+    n = len(roster)
     targets: Dict[str, Dict[str, int]] = {r: {} for r in opp}
 
     for role, total in opp.items():
         base = total // n
         rem = total % n
         # Extra opportunities distributed by sales order (highest first) ONLY if needed
-        for i, name in enumerate(DEFAULT_ROSTER):
+        for i, name in enumerate(roster):
             targets[role][name] = base
         for i in range(rem):
-            targets[role][DEFAULT_ROSTER[i]] += 1
+            targets[role][sales_order[i]] += 1
 
     return targets
 
@@ -485,11 +485,12 @@ def build_schedule(config: BuildConfig,
     days = month_days(year, month)
 
     push_days = push_days_for_month(year, month)
+    observed_holidays = observed_holidays_for_year(year)
 
     # Primary targets: PN/AN should be as even as possible across the month.
     # We compute targets based on total opportunities; extras go to top of sales_order.
     # We'll use these as soft scoring during search, not hard limits.
-    targets = compute_primary_targets(days, push_days)
+    targets = compute_primary_targets(days, push_days, config.roster, config.sales_order, observed_holidays)
 
     # Helper: last role day (carryover)
     def last_role(name: str, d: date) -> Optional[str]:
@@ -543,7 +544,7 @@ def build_schedule(config: BuildConfig,
 
     sunday_assignees = {}
     prev_sun = get_prev_sunday_assignee()
-    sundays = [d for d in days if is_sunday(d) and d not in OBSERVED_HOLIDAYS_2026]
+    sundays = [d for d in days if is_sunday(d) and d not in observed_holidays]
     if sundays:
         start_idx = 0
         if prev_sun and prev_sun in roster:
@@ -558,26 +559,35 @@ def build_schedule(config: BuildConfig,
 
     # Pre-assign Sunday PN and Saturday-before AN
     for sd, who in sunday_assignees.items():
-        if who in cons.hard_off.get(sd, set()):
-            # hard off trumps; rotate to next available
+        if (
+            who in cons.hard_off.get(sd, set())
+            or who in cons.avoid_roles.get((sd, "PN"), set())
+        ):
+            # hard off/avoid role trumps; rotate to next available
             for step in range(1, len(roster)+1):
                 cand = roster[(roster.index(who)+step) % len(roster)]
-                if cand not in cons.hard_off.get(sd, set()):
+                if (
+                    cand not in cons.hard_off.get(sd, set())
+                    and cand not in cons.avoid_roles.get((sd, "PN"), set())
+                ):
                     who = cand
                     sunday_assignees[sd] = who
                     break
         schedule[sd.isoformat()]["PN"] = who
 
         sat = sd - timedelta(days=1)
-        if sat.month == month and sat not in OBSERVED_HOLIDAYS_2026:
+        if sat.month == month and sat not in observed_holidays:
             # force AN Saturday before, unless hard off
-            if who not in cons.hard_off.get(sat, set()):
+            if (
+                who not in cons.hard_off.get(sat, set())
+                and who not in cons.avoid_roles.get((sat, "AN"), set())
+            ):
                 schedule[sat.isoformat()]["AN"] = who
 
     # Primary role assignment order (fill all PN/AN/W for month)
     primary_slots: List[Tuple[date, str]] = []
     for d in days:
-        req = roles_required_for_day(d, push_days)
+        req = roles_required_for_day(d, push_days, observed_holidays)
         for role in ("PN", "AN", "W"):
             if role in req:
                 # if already pre-assigned, skip
@@ -609,7 +619,7 @@ def build_schedule(config: BuildConfig,
                 role_counts[r][roles[r]] += 1
 
     def can_assign_primary(d: date, role: str, name: str) -> bool:
-        if d in OBSERVED_HOLIDAYS_2026:
+        if d in observed_holidays:
             return False
         if name in cons.hard_off.get(d, set()):
             return False
@@ -726,7 +736,7 @@ def build_schedule(config: BuildConfig,
     # - avoid_roles on BU* if specified (optional)
     bu_slots: List[Tuple[date, str]] = []
     for d in days:
-        req = roles_required_for_day(d, push_days)
+        req = roles_required_for_day(d, push_days, observed_holidays)
         for role in ("BU1","BU2","BU3","BU4"):
             if role in req:
                 if role in schedule[d.isoformat()]:
@@ -735,7 +745,7 @@ def build_schedule(config: BuildConfig,
 
     # track BU role last assigned to person yesterday (across boundary)
     def can_assign_bu(d: date, role: str, name: str) -> bool:
-        if d in OBSERVED_HOLIDAYS_2026:
+        if d in observed_holidays:
             return False
         if name in cons.hard_off.get(d, set()):
             return False
@@ -813,6 +823,8 @@ def export_schedule_to_excel(schedule: Dict[str, Dict[str, str]],
                              year: int,
                              month: int,
                              out_xlsx: str,
+                             roster: List[str],
+                             observed_holidays: Set[date],
                              title: Optional[str] = None):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -909,7 +921,7 @@ def export_schedule_to_excel(schedule: Dict[str, Dict[str, str]],
 
             # Holiday: if observed holiday, you may want to merge and write text;
             # for February 2026 none, but leaving here for future:
-            if d in OBSERVED_HOLIDAYS_2026:
+            if d in observed_holidays:
                 # Clear names/labels and write holiday text across the block
                 for off in range(1, 8):
                     ws.cell(R+off, col_start, "").value = ""
@@ -924,7 +936,6 @@ def export_schedule_to_excel(schedule: Dict[str, Dict[str, str]],
     ws2["A1"] = f"Summary: {calendar.month_name[month]} {year}"
     ws2["A1"].font = Font(name="Calibri", size=14, bold=True)
 
-    roster = DEFAULT_ROSTER
     roles_to_count = ["PN","AN","W","BU1","BU2","BU3","BU4"]
     # headers
     ws2["A3"] = "Name"
@@ -943,7 +954,7 @@ def export_schedule_to_excel(schedule: Dict[str, Dict[str, str]],
                 continue
             if r in counts[n]:
                 counts[n][r] += 1
-            hours[n] += hours_for_role(d, r)
+            hours[n] += hours_for_role(d, r, observed_holidays)
 
     for i, n in enumerate(roster, start=4):
         ws2.cell(i, 1, n)
@@ -1007,7 +1018,14 @@ def main():
     Path(out_json).write_text(json.dumps(sched, indent=2), encoding="utf-8")
     print(f"✅ Wrote schedule JSON → {out_json}")
 
-    export_schedule_to_excel(sched, year, month, out_xlsx)
+    export_schedule_to_excel(
+        sched,
+        year,
+        month,
+        out_xlsx,
+        roster,
+        observed_holidays_for_year(year),
+    )
     print(f"✅ Wrote schedule Excel → {out_xlsx}")
 
 if __name__ == "__main__":
