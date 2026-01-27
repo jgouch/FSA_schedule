@@ -1189,7 +1189,8 @@ def export_schedule_to_excel(schedule: Dict[str, Dict[str, str]],
     week_starts = sorted({week_start_sun(d) for d in month_days(year, month)})
 
     def hours_on_day(dd: date, person: str) -> int:
-        if dd in observed_holidays:
+        hols = observed_holidays if dd.year == year else observed_holidays_for_year(dd.year)
+        if dd in hols:
             return 0
         if dd.month == month and dd.year == year:
             roles = schedule.get(dd.isoformat(), {})
@@ -1200,7 +1201,7 @@ def export_schedule_to_excel(schedule: Dict[str, Dict[str, str]],
         day_hours = 0
         for rr, nn in roles.items():
             if nn == person:
-                day_hours = max(day_hours, hours_for_role(dd, rr, observed_holidays))
+                day_hours = max(day_hours, hours_for_role(dd, rr, hols))
         return day_hours
 
     red_fill = PatternFill("solid", fgColor="FFC7CE")
@@ -1302,7 +1303,7 @@ def main():
 
     year, month = parse_month_arg(args.month)
 
-    roster = DEFAULT_ROSTER[:]
+    roster = load_roster_from_json(args.roster_json) if args.roster_json else DEFAULT_ROSTER[:]
     timeoff = load_timeoff_from_xlsx(args.timeoff_xlsx, args.timeoff_sheet)
     cons = compile_constraints(timeoff)
 
