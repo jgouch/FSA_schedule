@@ -525,6 +525,15 @@ def compile_constraints(timeoff: List[TimeOffRule]) -> Constraints:
                 avoid_roles.setdefault((r.d, role.upper()), set()).add(r.name)
     return Constraints(hard_off=hard_off, avoid_roles=avoid_roles)
 
+from typing import Dict, List, Set
+from datetime import date
+
+def _rotate_left(lst: List[str], k: int) -> List[str]:
+    if not lst:
+        return lst
+    k = k % len(lst)
+    return lst[k:] + lst[:k]
+
 def compute_primary_targets(
     days: List[date],
     push_days: Set[date],
@@ -532,7 +541,7 @@ def compute_primary_targets(
     sales_order: List[str],
     observed_holidays: Set[date],
 ) -> Dict[str, Dict[str, int]]:
-    
+    # Count opportunities for each primary role across the month
     opp = {"PN": 0, "AN": 0, "W": 0}
     for d in days:
         req = roles_required_for_day(d, push_days, observed_holidays)
@@ -544,16 +553,42 @@ def compute_primary_targets(
     if n == 0:
         raise ValueError("Roster is empty")
 
-    priority = [x for x in sales_order if x in roster] + [x for x in roster if x not in sales_order]
+    # Sales-based priority, but ensure it only contains roster members,
+    # and append any missing roster members at the end.
+    base_priority = [x for x in sales_order if x in roster] + [x for x in roster if x not in sales_order]
 
-    targets: Dict[str, Dict[str, int]] = {r: {} for r in opp}
-    for role, total in opp.items():
-        base = total // n
-        rem = total % n
-        for name in roster:
-            targets[role][name] = base
-        for i in range(rem):
-            targets[role][priority[i % len(priority)]] += 1
+    # Initialize targets dict: targets[role][name] = quota
+    targets: Dict[str, Dict[str, int]] = {role: {name: 0 for name in roster} for role in opp}
+
+    # --- PN ---
+    total_pn = opp["PN"]
+    base_pn = total_pn // n
+    rem_pn  = total_pn % n
+    for name in roster:
+        targets["PN"][name] = base_pn
+    pn_priority = base_priority  # no offset for PN
+    for i in range(rem_pn):
+        targets["PN"][pn_priority[i]] += 1
+
+    # --- AN (offset by PN remainder) ---
+    total_an = opp["AN"]
+    base_an = total_an // n
+    rem_an  = total_an % n
+    for name in roster:
+        targets["AN"][name] = base_an
+    an_priority = _rotate_left(base_priority, rem_pn)
+    for i in range(rem_an):
+        targets["AN"][an_priority[i]] += 1
+
+    # --- W (offset by PN+AN remainders) ---
+    total_w = opp["W"]
+    base_w = total_w // n
+    rem_w  = total_w % n
+    for name in roster:
+        targets["W"][name] = base_w
+    w_priority = _rotate_left(base_priority, (rem_pn + rem_an) % n)
+    for i in range(rem_w):
+        targets["W"][w_priority[i]] += 1
 
     return targets
 
