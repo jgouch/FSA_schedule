@@ -317,8 +317,10 @@ def load_sales_ranking_from_timeoff_xlsx(
     order_set = set(order)
 
     if not order:
-        # fallback to seniority
-        return [n for n in SENIORITY_ORDER if n in roster_set]
+        # fallback to seniority, then append any remaining roster members
+        fallback = [n for n in SENIORITY_ORDER if n in roster_set]
+        fallback += [n for n in roster_names if n not in fallback]
+        return fallback
 
     missing = roster_set - order_set
     extra = order_set - roster_set
@@ -707,7 +709,8 @@ def build_schedule(config: BuildConfig,
                 s -= 50.0  # discourage more Monday PN strongly (hard already blocks >1)
 
         # prefer sales-order fairness only for extras (handled by targets), but slight bias:
-        s += (len(sales_order) - sales_order.index(name)) * 0.05
+        if name in sales_order:
+            s += (len(sales_order) - sales_order.index(name)) * 0.05
 
         # randomness for variety
         s += rng.random() * 0.25
