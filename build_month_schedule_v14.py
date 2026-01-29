@@ -1,0 +1,958 @@
+#!/usr/bin/env python3
+"""
+build_month_schedule_v14.py
+
+End-to-end month builder:
+- Reads TimeOff.xlsx (monthly request sheet + Sales Ranking tab)
+- Reads prior month schedule JSON for cross-month constraints
+- Generates schedule for target month (primaries then BU)
+- Exports:
+    - schedule JSON (machine truth)
+    - Excel calendar workbook (no template required) matching your geometry + colors
+
+LOCKED CALENDAR GEOMETRY:
+- Grid weeks: UP TO 6 (rows 3..50), each week is 8 rows tall
+- Each day block: 3 columns x 8 rows
+- Role mapping (R = week_start_row, cols = start/mid/end):
+    PN label: (start, R+1), PN name: (mid, R+1)
+    AN label: (start, R+2), AN name: (mid, R+2)
+    W  label: (start, R+3), W  name: (mid, R+3)
+    BU1 name: (mid, R+4)
+    BU2 name: (mid, R+5)
+    BU3 name: (mid, R+6)
+    BU4 name (push-week Saturday only): (mid, R+7)
+
+Logic Changes (v14):
+- Two-Pass Solver: Tries STRICT fairness/rules first. If fails, resets and retries RELAXED (best effort).
+- Holiday Caps: Weekly hour caps waived on holiday weeks.
+- Year-Awareness: Boundary checks explicitly check year+month.
+- Audit: Prints deviation report at end.
+"""
+
+from __future__ import annotations
+
+import argparse
+import calendar
+import json
+import random
+import re
+import copy
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.datetime import from_excel
+
+
+# ----------------------------
+# Constants / settings
+# ----------------------------
+
+SUNDAY_FILL = "FFF2CC"
+NONMONTH_FILL = "F2F2F2"
+
+FONT_MAIN = Font(name="Calibri", size=11)
+FONT_DAY_NUM = Font(name="Calibri", size=11, bold=True)
+FONT_HEADER = Font(name="Calibri", size=24, bold=True)
+ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+THIN_BORDER = Border(left=Side(style='thin'), 
+                     right=Side(style='thin'), 
+                     top=Side(style='thin'), 
+                     bottom=Side(style='thin'))
+
+GRID_WEEK_START_ROW = 3
+WEEK_HEIGHT = 8
+DAY_WIDTH = 3
+SUN_START_COL = 2  # B
+MAX_WEEKS = 6  
+
+ROLE_PRIMARY = ["PN", "AN", "W"]
+ROLE_BUS = ["BU1", "BU2", "BU3", "BU4"]
+
+OBSERVED_HOLIDAYS_BY_YEAR = {
+    2026: {
+        date(2026, 1, 1),   # New Year's Day
+        date(2026, 5, 25),  # Memorial Day
+        date(2026, 7, 3),   # Independence Day observed
+        date(2026, 9, 7),   # Labor Day
+        date(2026, 11, 26), # Thanksgiving
+        date(2026, 12, 25), # Christmas
+    }
+}
+
+DEFAULT_ROSTER = ["Greg", "Mark", "Dawn", "Will", "CJ", "Kyle"]
+SENIORITY_ORDER = ["Mark", "Dawn", "Will", "Kyle", "CJ", "Greg"]
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def weekday_sun0(d: date) -> int:
+    return (d.weekday() + 1) % 7
+
+def is_sunday(d: date) -> bool:
+    return weekday_sun0(d) == 0
+
+def is_saturday(d: date) -> bool:
+    return weekday_sun0(d) == 6
+
+def is_weekday(d: date) -> bool:
+    return d.weekday() < 5
+
+def month_days(year: int, month: int) -> List[date]:
+    n = calendar.monthrange(year, month)[1]
+    return [date(year, month, d) for d in range(1, n+1)]
+
+def quarter_tag_for_month(year: int, month: int) -> str:
+    q = (month - 1) // 3 + 1
+    return f"{year}Q{q}"
+
+def norm_name(x) -> str:
+    return re.sub(r"\s+", " ", str(x).strip())
+
+def parse_month_arg(s: str) -> Tuple[int, int]:
+    m = re.match(r"^\s*(\d{4})-(\d{2})\s*$", s)
+    if not m:
+        raise ValueError("Month must be YYYY-MM, e.g. 2026-02")
+    return int(m.group(1)), int(m.group(2))
+
+def compute_observed_holidays_us(year: int) -> Set[date]:
+    out: Set[date] = set()
+    out.add(date(year, 1, 1)) # New Years
+    # Memorial Day (Last Mon May)
+    d = date(year, 5, 31)
+    while d.weekday() != 0: d -= timedelta(days=1)
+    out.add(d)
+    # July 4
+    july4 = date(year, 7, 4)
+    if july4.weekday() == 5: out.add(date(year, 7, 3))
+    elif july4.weekday() == 6: out.add(date(year, 7, 5))
+    else: out.add(july4)
+    # Labor Day (1st Mon Sep)
+    d = date(year, 9, 1)
+    while d.weekday() != 0: d += timedelta(days=1)
+    out.add(d)
+    # Thanksgiving (4th Thu Nov)
+    d = date(year, 11, 1)
+    while d.weekday() != 3: d += timedelta(days=1)
+    out.add(d + timedelta(days=21))
+    # Christmas
+    out.add(date(year, 12, 25))
+    return out
+
+def observed_holidays_for_year(year: int) -> Set[date]:
+    return OBSERVED_HOLIDAYS_BY_YEAR.get(year, compute_observed_holidays_us(year))
+
+def week_start_sun(d: date) -> date:
+    return d - timedelta(days=weekday_sun0(d))
+
+# Pay periods logic
+PAY_PERIOD_ANCHOR_START = date(2026, 1, 25)
+
+def generate_payperiods(anchor_start: date, start_date: date, end_date: date) -> List[Tuple[date, date]]:
+    a = anchor_start
+    while a > start_date:
+        a -= timedelta(days=14)
+    periods: List[Tuple[date, date]] = []
+    cur = a
+    while cur <= end_date:
+        periods.append((cur, cur + timedelta(days=13)))
+        cur += timedelta(days=14)
+    return periods
+
+def parse_excel_date(value) -> date:
+    if isinstance(value, datetime): return value.date()
+    if isinstance(value, date): return value
+    if isinstance(value, (int, float)):
+        try: return from_excel(value).date()
+        except: pass
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try: return datetime.strptime(s, fmt).date()
+        except: continue
+    raise ValueError(f"Unrecognized date format: {value!r}")
+
+
+# ----------------------------
+# Inputs
+# ----------------------------
+
+@dataclass
+class TimeOffRule:
+    name: str
+    d: date
+    hard: bool = True
+    avoid_roles: Set[str] = None
+
+def load_timeoff_from_xlsx(xlsx_path: str, sheet_name: str) -> List[TimeOffRule]:
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"Missing timeoff sheet '{sheet_name}'")
+    ws = wb[sheet_name]
+    
+    headers = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(1, c).value
+        if v: headers[str(v).strip().lower()] = c
+
+    c_name = headers.get("name")
+    if not c_name: raise ValueError("TimeOff sheet missing 'Name' column")
+    c_date = headers.get("date")
+    c_start = headers.get("start")
+    c_end = headers.get("end")
+    c_hard = headers.get("hard")
+    c_avoid = headers.get("avoidroles")
+
+    def parse_hard(v) -> bool:
+        if v is None or str(v).strip() == "": return True
+        return str(v).strip().lower() in ("true", "1", "yes", "y")
+
+    rules = []
+    for r in range(2, ws.max_row + 1):
+        nv = ws.cell(r, c_name).value
+        if not nv: continue
+        name = norm_name(nv)
+        
+        dates = []
+        dv = ws.cell(r, c_date).value if c_date else None
+        sv = ws.cell(r, c_start).value if c_start else None
+        ev = ws.cell(r, c_end).value if c_end else None
+
+        if dv:
+            dates = [parse_excel_date(dv)]
+        elif sv and ev:
+            sd = parse_excel_date(sv)
+            ed = parse_excel_date(ev)
+            cur = sd
+            while cur <= ed:
+                dates.append(cur)
+                cur += timedelta(days=1)
+        else:
+            continue
+
+        hard = parse_hard(ws.cell(r, c_hard).value) if c_hard else True
+        av = set()
+        if c_avoid:
+            val = ws.cell(r, c_avoid).value
+            if val:
+                av = {p.strip().upper() for p in str(val).split(",") if p.strip()}
+
+        for d in dates:
+            rules.append(TimeOffRule(name, d, hard, av))
+    return rules
+
+def load_roster_from_json(path: str) -> List[str]:
+    data = json.loads(Path(path).read_text("utf-8"))
+    return [norm_name(x) for x in data if str(x).strip()]
+
+def load_payperiods_from_json(path: str) -> List[Tuple[date, date]]:
+    data = json.loads(Path(path).read_text("utf-8"))
+    out = []
+    for obj in data:
+        s = datetime.strptime(str(obj["start"]).strip(), "%Y-%m-%d").date()
+        e = datetime.strptime(str(obj["end"]).strip(), "%Y-%m-%d").date()
+        out.append((s, e))
+    out.sort(key=lambda t: t[0])
+    return out
+
+def load_sales_ranking_from_timeoff_xlsx(xlsx_path, sheet_name, year, month, roster_names):
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"Missing sheet '{sheet_name}'")
+    ws = wb[sheet_name]
+    target = quarter_tag_for_month(year, month)
+    
+    rows = {}
+    for r in range(2, ws.max_row + 1):
+        p = ws.cell(r, 1).value
+        if not p: continue
+        p = str(p).strip()
+        ranks = []
+        for c in range(2, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if v and str(v).strip():
+                ranks.append(norm_name(v))
+        if ranks: rows[p] = ranks
+
+    def key(x):
+        m = re.match(r"(\d{4})Q(\d)", x)
+        return (int(m.group(1)), int(m.group(2))) if m else (0,0)
+
+    order = rows.get(target)
+    if not order:
+        candidates = sorted(rows.keys(), key=key)
+        if candidates: order = rows[candidates[-1]]
+    
+    # Fallback/Validation
+    roster_set = set(roster_names)
+    if not order:
+        return [n for n in SENIORITY_ORDER if n in roster_set] + [n for n in roster_names if n not in SENIORITY_ORDER]
+    
+    # Ensure all roster members included
+    order = [x for x in order if x in roster_set]
+    missing = roster_set - set(order)
+    order.extend(sorted(list(missing)))
+    return order
+
+def load_schedule_json(path: str) -> Dict[str, Dict[str, str]]:
+    return json.loads(Path(path).read_text("utf-8"))
+
+def role_of(prev, d, name):
+    return {n: r for r, n in prev.get(d.isoformat(), {}).items()}.get(name)
+
+def worked_prev(prev, d, name):
+    return name in prev.get(d.isoformat(), {}).values()
+
+
+# ----------------------------
+# Core Logic
+# ----------------------------
+
+def roles_required_for_day(d: date, push_days: Set[date], hols: Set[date]) -> List[str]:
+    if d in hols: return []
+    if is_sunday(d): return ["PN"]
+    req = ["PN", "AN"]
+    if is_weekday(d): req.append("W")
+    return req
+
+def hours_for_role(d: date, role: str, hols: Set[date]) -> int:
+    if d in hols: return 0
+    if is_sunday(d) and role == "PN": return 5
+    return 8
+
+def push_days_for_month(year: int, month: int) -> Set[date]:
+    last = date(year, month, calendar.monthrange(year, month)[1])
+    while last.weekday() != 4: last -= timedelta(days=1) # Find last Friday
+    days = {last - timedelta(days=i) for i in range(5)} # Mon-Fri
+    sat = last + timedelta(days=1)
+    if sat.month == month: days.add(sat)
+    return days
+
+@dataclass
+class BuildConfig:
+    year: int
+    month: int
+    roster: List[str]
+    sales_order: List[str]
+    max_consecutive_days: int = 5
+    lookback_days: int = 14
+    rng_seed: int = 11
+
+def compute_primary_targets(days, push_days, roster, sales_order, hols):
+    opp = {"PN": 0, "AN": 0, "W": 0}
+    for d in days:
+        req = roles_required_for_day(d, push_days, hols)
+        for r in opp:
+            if r in req: opp[r] += 1
+            
+    n = len(roster)
+    targets = {r: {p: 0 for p in roster} for r in opp}
+    
+    # Priority for extra shifts
+    # Ensure sales_order contains valid roster members only
+    valid_order = [x for x in sales_order if x in roster]
+    
+    def distribute(role, total):
+        base = total // n
+        rem = total % n
+        for p in roster: targets[role][p] = base
+        # Rotate priority for fairness
+        offset = 0
+        if role == "AN": offset = opp["PN"] % n
+        if role == "W": offset = (opp["PN"] + opp["AN"]) % n
+        
+        rotated_order = valid_order[offset:] + valid_order[:offset]
+        for i in range(rem):
+            targets[role][rotated_order[i]] += 1
+
+    for r in opp: distribute(r, opp[r])
+    return targets
+
+
+def build_schedule(config: BuildConfig,
+                   prev_sched: Dict[str, Dict[str, str]],
+                   cons: Constraints,
+                   payperiods: Optional[List[Tuple[date, date]]] = None) -> Dict[str, Dict[str, str]]:
+    
+    rng = random.Random(config.rng_seed)
+    year, month = config.year, config.month
+    days = month_days(year, month)
+    
+    hols = observed_holidays_for_year(year)
+    push_days = push_days_for_month(year, month)
+    targets = compute_primary_targets(days, push_days, config.roster, config.sales_order, hols)
+
+    # State containers (will be reset if strict solve fails)
+    schedule: Dict[str, Dict[str, str]] = {}
+    role_counts = {r: {n: 0 for n in config.roster} for r in ["PN", "AN", "W"]}
+    total_hours = {n: 0 for n in config.roster}
+    pn_weekday_counts = {n: {i: 0 for i in range(7)} for n in config.roster}
+    monday_pn_used = {n: 0 for n in config.roster}
+
+    def reset_state():
+        nonlocal schedule, role_counts, total_hours, pn_weekday_counts, monday_pn_used
+        schedule = {d.isoformat(): {} for d in days}
+        role_counts = {r: {n: 0 for n in config.roster} for r in ["PN", "AN", "W"]}
+        total_hours = {n: 0 for n in config.roster}
+        pn_weekday_counts = {n: {i: 0 for i in range(7)} for n in config.roster}
+        monday_pn_used = {n: 0 for n in config.roster}
+
+    # -- Logic Checks --
+    def last_role(name, d):
+        for k in range(1, config.lookback_days + 1):
+            p = d - timedelta(days=k)
+            # FIX 4: Strict year/month check
+            if p.year == year and p.month == month:
+                roles = schedule.get(p.isoformat(), {})
+                for r, n in roles.items():
+                    if n == name: return r
+            else:
+                rr = role_of(prev_sched, p, name)
+                if rr: return rr
+        return None
+
+    def consecutive_streak(name, d):
+        streak = 0
+        for k in range(1, config.lookback_days + 1):
+            p = d - timedelta(days=k)
+            worked = False
+            if p.year == year and p.month == month:
+                worked = name in schedule.get(p.isoformat(), {}).values()
+            else:
+                worked = worked_prev(prev_sched, p, name)
+            if worked: streak += 1
+            else: break
+        return streak
+
+    def week_contains_holiday_or_push(ws):
+        for i in range(7):
+            dd = ws + timedelta(days=i)
+            if dd in hols or dd in push_days: return True
+        return False
+
+    def week_hours(name, d):
+        ws = week_start_sun(d)
+        tot = 0
+        first_day = date(year, month, 1)
+        for i in range(7):
+            dd = ws + timedelta(days=i)
+            if dd.year == year and dd.month == month:
+                # Sum hours from current schedule
+                roles = schedule.get(dd.isoformat(), {})
+                dh = 0
+                for r, n in roles.items():
+                    if n == name:
+                        dh = max(dh, hours_for_role(dd, r, hols))
+                tot += dh
+            elif dd < first_day:
+                # Carryover
+                roles = prev_sched.get(dd.isoformat(), {})
+                dh = 0
+                for r, n in roles.items():
+                    if n == name:
+                        dh = max(dh, hours_for_role(dd, r, observed_holidays_for_year(dd.year)))
+                tot += dh
+        return tot
+
+    def find_pp(d):
+        if not payperiods: return None
+        for s, e in payperiods:
+            if s <= d <= e: return (s, e)
+        return None
+
+    def pp_hours(name, d):
+        pp = find_pp(d)
+        if not pp: return 0
+        s, e = pp
+        tot = 0
+        cur = s
+        first_day = date(year, month, 1)
+        while cur <= e:
+            if cur.year == year and cur.month == month:
+                roles = schedule.get(cur.isoformat(), {})
+                dh = 0
+                for r, n in roles.items():
+                    if n == name:
+                        dh = max(dh, hours_for_role(cur, r, hols))
+                tot += dh
+            elif cur < first_day:
+                roles = prev_sched.get(cur.isoformat(), {})
+                dh = 0
+                for r, n in roles.items():
+                    if n == name:
+                        dh = max(dh, hours_for_role(cur, r, observed_holidays_for_year(cur.year)))
+                tot += dh
+            cur += timedelta(days=1)
+        return tot
+
+    def can_assign_primary(d, role, name, strict_mode):
+        if d in hols: return False
+        if name in cons.hard_off.get(d, set()): return False
+        if name in cons.avoid_roles.get((d, role), set()): return False
+        if name in schedule[d.isoformat()].values(): return False
+        
+        # Primary back-to-back: STRICT ALWAYS
+        if last_role(name, d) == role: return False
+        
+        # Consecutive Days
+        if consecutive_streak(name, d) >= config.max_consecutive_days: return False
+        
+        # Weekly Hours (FIX 3: Relax on Holiday OR Push)
+        ws = week_start_sun(d)
+        if not week_contains_holiday_or_push(ws):
+            wh = week_hours(name, d)
+            if wh + hours_for_role(d, role, hols) > 40: return False
+            
+            # 5-day cap logic included here effectively via hours or explicit check?
+            # User wants 5-day cap relaxed on holiday weeks too.
+            # Let's count days
+            days_worked = 0
+            for i in range(7):
+                dd = ws + timedelta(days=i)
+                worked = False
+                if dd.year == year and dd.month == month:
+                    if name in schedule.get(dd.isoformat(), {}).values(): worked = True
+                elif dd < date(year, month, 1):
+                    if worked_prev(prev_sched, dd, name): worked = True
+                if worked: days_worked += 1
+            if days_worked >= 5: return False
+
+        # Pay Period Cap (Relax on Push)
+        if not week_contains_holiday_or_push(ws): # Relax PP cap on heavy weeks? Usually just 80h/2weeks
+             # The constraint says "80h cap + audit". 
+             # Let's keep it soft/hard? User said "Relaxed for push week".
+             # We'll enforce strictly in strict mode, ignoring in relaxed?
+             # Or just check it.
+             curr_pp_h = pp_hours(name, d)
+             if curr_pp_h + hours_for_role(d, role, hols) > 80: return False
+
+        # STRICT MODE CHECKS (Fix 1 & 5)
+        if strict_mode:
+            # Quota Check
+            if role_counts[role][name] >= targets[role][name]: return False
+            # Monday PN Check
+            if role == "PN" and weekday_sun0(d) == 1 and monday_pn_used[name] >= 1: return False
+            
+        return True
+
+    def score_primary(d, role, name):
+        s = 0.0
+        # Penalties used in Relaxed Mode
+        t = targets[role][name]
+        c = role_counts[role][name]
+        s += (t - c) * 50.0 # Huge weight to fairness
+        
+        # Penalty for Monday PN
+        if role == "PN" and weekday_sun0(d) == 1 and monday_pn_used[name] >= 1:
+            s -= 500.0
+            
+        # Penalty for total hours (Greg rule)
+        s -= total_hours[name] * 2.0
+        
+        # Penalty for clustering in current pay period
+        s -= pp_hours(name, d) * 1.0
+        
+        # Soft weekday clustering for PN
+        if role == "PN":
+            s -= pn_weekday_counts[name][weekday_sun0(d)] * 10.0
+            
+        return s + rng.random()
+
+    # --- Solver Core ---
+    def run_solver(strict_mode: bool) -> bool:
+        # Pre-assign Sunday PNs (Rotation)
+        # We must re-calculate Sunday assignees every time? No, they are fixed by roster rotation.
+        # But we need to apply them to the empty schedule.
+        
+        # Logic: Find first Sunday. Look at prev_sched last Sunday PN. Rotate.
+        # This is deterministic.
+        
+        sundays = [d for d in days if is_sunday(d) and d not in hols]
+        
+        # Find start index
+        prev_pn = None
+        # Scan prev sched backwards
+        pd = sorted(prev_sched.keys())
+        for x in reversed(pd):
+            xd = datetime.strptime(x, "%Y-%m-%d").date()
+            if is_sunday(xd):
+                r = prev_sched[x].get("PN")
+                if r in config.roster:
+                    prev_pn = r
+                    break
+        
+        start_idx = 0
+        if prev_pn:
+            start_idx = (config.roster.index(prev_pn) + 1) % len(config.roster)
+            
+        # Assign Sundays
+        for i, sd in enumerate(sundays):
+            who = config.roster[(start_idx + i) % len(config.roster)]
+            
+            # Check constraints? Strict mode applies?
+            # Sunday rotation is usually absolute. But if hard-off?
+            # We try to force it. If hard-off, we must skip or rotate?
+            # Let's assume strict rotation but skip if Hard Off.
+            if who in cons.hard_off.get(sd, set()):
+                # Try next person?
+                # Simple fallback: linear scan
+                offset = 1
+                while who in cons.hard_off.get(sd, set()) and offset < len(config.roster):
+                    who = config.roster[(start_idx + i + offset) % len(config.roster)]
+                    offset += 1
+            
+            # Assign
+            # Check basic hard rules (consecutive, etc)
+            if can_assign_primary(sd, "PN", who, strict_mode=False): # Sundays are special, don't block on quotas
+                schedule[sd.isoformat()]["PN"] = who
+                role_counts["PN"][who] += 1
+                total_hours[who] += 5
+                pn_weekday_counts[who][0] += 1
+                
+                # Pair AN on Saturday
+                sat = sd - timedelta(days=1)
+                if sat.month == month and sat not in hols:
+                    if can_assign_primary(sat, "AN", who, strict_mode=False):
+                        schedule[sat.isoformat()]["AN"] = who
+                        role_counts["AN"][who] += 1
+                        total_hours[who] += 8
+
+        # Generate Primary Slots
+        slots = []
+        for d in days:
+            req = roles_required_for_day(d, push_days, hols)
+            for r in ["PN", "AN", "W"]:
+                if r in req and r not in schedule[d.isoformat()]:
+                    slots.append((d, r))
+        
+        # Backtracking
+        def backtrack(idx):
+            if idx >= len(slots): return True
+            d, role = slots[idx]
+            
+            # Candidates
+            cands = [n for n in config.roster if can_assign_primary(d, role, n, strict_mode)]
+            rng.shuffle(cands)
+            cands.sort(key=lambda n: score_primary(d, role, n), reverse=True)
+            
+            for p in cands:
+                # Do assignment
+                schedule[d.isoformat()][role] = p
+                role_counts[role][p] += 1
+                hrs = hours_for_role(d, role, hols)
+                total_hours[p] += hrs
+                if role == "PN":
+                    wd = weekday_sun0(d)
+                    pn_weekday_counts[p][wd] += 1
+                    if wd == 1: monday_pn_used[p] += 1
+                
+                if backtrack(idx + 1): return True
+                
+                # Undo
+                del schedule[d.isoformat()][role]
+                role_counts[role][p] -= 1
+                total_hours[p] -= hrs
+                if role == "PN":
+                    wd = weekday_sun0(d)
+                    pn_weekday_counts[p][wd] -= 1
+                    if wd == 1: monday_pn_used[p] -= 1
+            
+            return False
+
+        return backtrack(0)
+
+    # --- EXECUTE TWO-PASS ---
+    print("Attempting STRICT solve (Pass 1)...")
+    reset_state()
+    if not run_solver(strict_mode=True):
+        print(">> Strict solve failed. Switching to RELAXED solve (Pass 2)...")
+        reset_state()
+        if not run_solver(strict_mode=False):
+            raise RuntimeError("❌ Solver failed even in relaxed mode. Constraints are too tight.")
+        else:
+            print(">> Relaxed solve successful.")
+    else:
+        print(">> Strict solve successful.")
+
+    # --- BU FILL (Smart Logic from v12/13) ---
+    bu_queue = []
+    for d in days:
+        if d in hols: continue
+        ideal = []
+        if d in push_days:
+            ideal = ["BU1", "BU2", "BU3", "BU4"] if is_saturday(d) else ["BU1", "BU2", "BU3"]
+        elif weekday_sun0(d) == 1: ideal = ["BU1", "BU2", "BU3"] # Mon
+        elif is_weekday(d): ideal = ["BU1", "BU2"] # Tue-Fri
+        
+        # Deterministic pool calc
+        assigned = set(schedule[d.isoformat()].values())
+        hard = cons.hard_off.get(d, set())
+        pool = sorted([p for p in config.roster if p not in assigned and p not in hard])
+        
+        # Safe slot generation (skip impossible BU1)
+        temp_pool = pool[:]
+        for rname in ideal:
+            if not temp_pool: break
+            # Are there valid candidates? (Check avoid)
+            # Soft avoid: we allow "avoiders" if necessary, but we prefer not to.
+            # But the slot generation needs to know if *anyone* can fill it.
+            # In v13 we said: generate it if anyone is free.
+            # So we just consume a body.
+            bu_queue.append((d, rname))
+            temp_pool.pop(0) # Reserve one
+
+    # BU Solver
+    def can_bu(d, role, p):
+        # Relaxed Back-to-back for BU
+        if d in hols: return False
+        if p in cons.hard_off.get(d, set()): return False
+        if p in schedule[d.isoformat()].values(): return False
+        if consecutive_streak(p, d) >= config.max_consecutive_days: return False
+        # Relaxed hours caps already checked in 'would_exceed' helpers?
+        # Re-implement inline for speed/clarity
+        ws = week_start_sun(d)
+        if not week_contains_holiday_or_push(ws):
+             wh = week_hours(p, d)
+             if wh + 8 > 40: return False # BU is always 8h
+             # 5 day cap
+             days_w = 0
+             for i in range(7):
+                 dd = ws + timedelta(days=i)
+                 if dd.year == year and dd.month == month:
+                     if p in schedule.get(dd.isoformat(), {}).values(): days_w += 1
+                 elif dd < date(year, month, 1):
+                     if worked_prev(prev_sched, dd, p): days_w += 1
+             if days_w >= 5: return False
+        return True
+
+    def bu_score(d, role, p):
+        s = rng.random()
+        s -= total_hours[p] * 0.5
+        s -= pp_hours(p, d) * 1.0
+        if p in cons.avoid_roles.get((d, role), set()): s -= 1000.0 # Soft Avoid
+        if last_role(p, d) == role: s -= 50.0 # Soft Back-to-Back
+        return s
+
+    def solve_bu(idx):
+        if idx >= len(bu_queue): return True
+        d, role = bu_queue[idx]
+        cands = [p for p in config.roster if can_bu(d, role, p)]
+        rng.shuffle(cands)
+        cands.sort(key=lambda p: bu_score(d, role, p), reverse=True)
+        
+        for p in cands:
+            schedule[d.isoformat()][role] = p
+            total_hours[p] += 8
+            if solve_bu(idx + 1): return True
+            del schedule[d.isoformat()][role]
+            total_hours[p] -= 8
+        return False
+
+    if not solve_bu(0):
+        print("Warning: Could not fill all desired BU slots.")
+
+    # --- AUDIT ---
+    print("\n--- Schedule Fairness Audit ---")
+    print(f"{'Name':<10} {'PN (Tgt)':<10} {'AN':<5} {'W':<5} {'TotHrs':<8}")
+    for p in config.roster:
+        pn = role_counts["PN"][p]
+        an = role_counts["AN"][p]
+        w = role_counts["W"][p]
+        tgt = targets["PN"][p]
+        print(f"{p:<10} {pn} ({tgt})      {an:<5} {w:<5} {total_hours[p]:<8}")
+        if pn != tgt:
+            print(f"   -> Violation: PN count {pn} != Target {tgt}")
+
+    return schedule
+
+
+# ----------------------------
+# Excel Export
+# ----------------------------
+
+def export_to_excel(schedule, year, month, out_path, roster, hols, prev_sched, payperiods):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = calendar.month_name[month]
+    ws.sheet_view.showGridLines = False
+
+    # Styles
+    for col in range(2, 23):
+        ws.column_dimensions[get_column_letter(col)].width = 10
+    
+    # Calculate grid size
+    first = date(year, month, 1)
+    last = date(year, month, calendar.monthrange(year, month)[1])
+    offset = weekday_sun0(first)
+    weeks = (offset + last.day + 6) // 7
+    grid_weeks = 6 if weeks > 5 else 5
+    
+    for r in range(3, GRID_WEEK_START_ROW + WEEK_HEIGHT * grid_weeks):
+        ws.row_dimensions[r].height = 18
+
+    # Header
+    ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=22)
+    c = ws.cell(1, 2, f"{calendar.month_name[month]} {year}")
+    c.font = FONT_HEADER
+    c.alignment = ALIGN_CENTER
+
+    for wk in range(grid_weeks):
+        R = GRID_WEEK_START_ROW + WEEK_HEIGHT * wk
+        for dow in range(7):
+            col_start = SUN_START_COL + DAY_WIDTH * dow
+            day_num = (wk * 7 + dow) - offset + 1
+            
+            # Fill logic
+            fill = None
+            if 1 <= day_num <= last.day:
+                d = date(year, month, day_num)
+                if is_sunday(d): fill = PatternFill("solid", fgColor=SUNDAY_FILL)
+            else:
+                fill = PatternFill("solid", fgColor=NONMONTH_FILL)
+
+            # Draw block
+            for rr in range(R, R + WEEK_HEIGHT):
+                for cc in range(col_start, col_start + DAY_WIDTH):
+                    cell = ws.cell(rr, cc)
+                    cell.font = FONT_MAIN
+                    cell.alignment = ALIGN_CENTER
+                    cell.border = THIN_BORDER
+                    if fill: cell.fill = fill
+
+            if 1 <= day_num <= last.day:
+                d = date(year, month, day_num)
+                # Date number
+                c = ws.cell(R, col_start + 2, day_num)
+                c.font = FONT_DAY_NUM
+                c.alignment = Alignment(horizontal="right", vertical="top")
+                
+                # Labels
+                ws.cell(R+1, col_start, "PN-")
+                ws.cell(R+2, col_start, "AN-")
+                if is_weekday(d): ws.cell(R+3, col_start, "W-")
+                
+                # Content
+                roles = schedule.get(d.isoformat(), {})
+                def write(off, r): ws.cell(R+off, col_start+1, roles.get(r, ""))
+                
+                write(1, "PN")
+                if not is_sunday(d): write(2, "AN")
+                if is_weekday(d): write(3, "W")
+                write(4, "BU1"); write(5, "BU2"); write(6, "BU3"); write(7, "BU4")
+                
+                if d in hols:
+                    ws.merge_cells(start_row=R, start_column=col_start, end_row=R+7, end_column=col_start+2)
+                    c = ws.cell(R, col_start, "HOLIDAY")
+                    c.alignment = ALIGN_CENTER
+                    c.font = Font(bold=True, size=14)
+
+    # Summary Tab
+    ws2 = wb.create_sheet("Summary")
+    ws2["A1"] = "Summary"
+    ws2["A1"].font = Font(bold=True, size=14)
+    
+    headers = ["Name"] + ROLE_PRIMARY + ROLE_BUS + ["Total", "Hours"]
+    ws2.append(headers)
+    
+    for p in roster:
+        row = [p]
+        tot_ass = 0
+        tot_hrs = 0
+        counts = {r: 0 for r in ROLE_PRIMARY + ROLE_BUS}
+        
+        # Recalc from final schedule to be safe
+        for d_iso, rmap in schedule.items():
+            for r, name in rmap.items():
+                if name == p:
+                    counts[r] += 1
+                    tot_hrs += hours_for_role(date.fromisoformat(d_iso), r, hols)
+        
+        for r in ROLE_PRIMARY + ROLE_BUS:
+            row.append(counts[r])
+            tot_ass += counts[r]
+        row.append(tot_ass)
+        row.append(tot_hrs)
+        ws2.append(row)
+
+    # Pay Period Tab
+    if payperiods:
+        ws3 = wb.create_sheet("Pay Period Hours")
+        ws3.append(["Pay Period", "Start", "End"] + roster)
+        for i, (s, e) in enumerate(payperiods, 1):
+            row = [f"PP{i}", s.isoformat(), e.isoformat()]
+            for p in roster:
+                # Recalc logic specific to this PP range
+                h = 0
+                cur = s
+                while cur <= e:
+                    if cur.year == year and cur.month == month:
+                        roles = schedule.get(cur.isoformat(), {})
+                        for r, n in roles.items():
+                            if n == p: h += hours_for_role(cur, r, hols)
+                    elif cur < date(year, month, 1):
+                        roles = prev_sched.get(cur.isoformat(), {})
+                        for r, n in roles.items():
+                            if n == p: h += hours_for_role(cur, r, observed_holidays_for_year(cur.year))
+                    cur += timedelta(days=1)
+                row.append(h)
+            ws3.append(row)
+
+    wb.save(out_path)
+
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--month", required=True)
+    ap.add_argument("--timeoff-xlsx", required=True)
+    ap.add_argument("--timeoff-sheet", required=True)
+    ap.add_argument("--prev-schedule", required=True)
+    ap.add_argument("--sales-sheet", default="Sales Ranking")
+    ap.add_argument("--roster-json")
+    ap.add_argument("--payperiods-json")
+    ap.add_argument("--payperiod-anchor-start", default="2026-01-25")
+    ap.add_argument("--out-json")
+    ap.add_argument("--out-xlsx")
+    ap.add_argument("--seed", type=int, default=11)
+    args = ap.parse_args()
+
+    year, month = parse_month_arg(args.month)
+    roster = load_roster_from_json(args.roster_json) if args.roster_json else DEFAULT_ROSTER[:]
+    timeoff = load_timeoff_from_xlsx(args.timeoff_xlsx, args.timeoff_sheet)
+    cons = compile_constraints(timeoff)
+    sales = load_sales_ranking_from_timeoff_xlsx(args.timeoff_xlsx, args.sales_sheet, year, month, roster)
+    prev = load_schedule_json(args.prev_schedule)
+    cfg = BuildConfig(year, month, roster, sales, rng_seed=args.seed)
+
+    if args.payperiods_json:
+        pps = load_payperiods_from_json(args.payperiods_json)
+    else:
+        # Generate generous range
+        ms = date(year, month, 1)
+        me = date(year, month, calendar.monthrange(year, month)[1])
+        anc = datetime.strptime(args.payperiod_anchor_start, "%Y-%m-%d").date()
+        raw = generate_payperiods(anc, ms - timedelta(days=28), me + timedelta(days=28))
+        pps = [p for p in raw if p[0] <= me and p[1] >= ms]
+
+    sched = build_schedule(cfg, prev, cons, pps)
+
+    oj = args.out_json or str(Path(args.prev_schedule).with_name(f"{year}_{month:02d}_schedule.json"))
+    ox = args.out_xlsx or str(Path(args.prev_schedule).with_name(f"{calendar.month_name[month]}_{year}_Schedule.xlsx"))
+
+    Path(oj).write_text(json.dumps(sched, indent=2), "utf-8")
+    print(f"✅ JSON: {oj}")
+    
+    export_to_excel(sched, year, month, ox, roster, observed_holidays_for_year(year), prev, pps)
+    print(f"✅ Excel: {ox}")
+
+if __name__ == "__main__":
+    main()
