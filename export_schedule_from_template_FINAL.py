@@ -136,7 +136,6 @@ class ExportConfig:
     grid_min: str = "B4"
     grid_max: str = "V40"
     # relative offsets from the day number cell:
-    date_col_offset: int = 0
     label_col_offset: int = 0
     name_col_offset: int = 1
     max_scan: int = 40
@@ -147,7 +146,7 @@ class ExportConfig:
 PRIMARY_LABELS = {"PN", "AN", "W", "PH"}  # W only in your world, but keep PH safe if appears
 BU_PREFIX = "BU"
 
-def looks_like_day_block(ws, r: int, c: int, cfg: ExportConfig) -> bool:
+def day_block_score(ws, r: int, c: int, cfg: ExportConfig) -> int:
     """
     Heuristic: below the day cell, we should see:
     - at least one primary label like "PN" or "AN" or "W"
@@ -157,6 +156,7 @@ def looks_like_day_block(ws, r: int, c: int, cfg: ExportConfig) -> bool:
     """
     labels_found = 0
     names_found = 0
+    primary_pairs = 0
     for rr in range(r + 1, min(r + 1 + cfg.max_scan, ws.max_row + 1)):
         label = ws.cell(rr, c + cfg.label_col_offset).value
         name = ws.cell(rr, c + cfg.name_col_offset).value
@@ -166,11 +166,21 @@ def looks_like_day_block(ws, r: int, c: int, cfg: ExportConfig) -> bool:
             t = t.split()[0]
             if t in PRIMARY_LABELS or t.startswith(BU_PREFIX):
                 labels_found += 1
+                if t in PRIMARY_LABELS and name not in (None, ""):
+                    primary_pairs += 1
         if name not in (None, ""):
             names_found += 1
-        if labels_found >= 1:
-            return True
-    return names_found >= 2
+        if primary_pairs >= 1:
+            break
+    if primary_pairs >= 1:
+        return primary_pairs * 10 + labels_found * 2 + min(names_found, 5)
+    if labels_found >= 1 and names_found >= 2:
+        return labels_found * 2 + min(names_found, 5)
+    return 0
+
+
+def looks_like_day_block(ws, r: int, c: int, cfg: ExportConfig) -> bool:
+    return day_block_score(ws, r, c, cfg) > 0
 
 
 def find_day_cells(ws, year: int, month: int, cfg: ExportConfig) -> List[Tuple[date, int, int]]:
@@ -179,7 +189,7 @@ def find_day_cells(ws, year: int, month: int, cfg: ExportConfig) -> List[Tuple[d
     """
     r1, c1 = a1_to_rowcol(cfg.grid_min)
     r2, c2 = a1_to_rowcol(cfg.grid_max)
-    found: Dict[int, Tuple[int, int]] = {}
+    found: Dict[int, Tuple[int, int, int]] = {}
 
     for r in range(r1, r2 + 1):
         for c in range(c1, c2 + 1):
@@ -197,21 +207,26 @@ def find_day_cells(ws, year: int, month: int, cfg: ExportConfig) -> List[Tuple[d
                     continue
 
             # ensure it is actually a day block
-            if not looks_like_day_block(ws, r, c, cfg):
+            score = day_block_score(ws, r, c, cfg)
+            if score <= 0:
                 continue
 
             if daynum in found:
-                msg = f"⚠️  Duplicate day '{daynum}' anchor at {ws.cell(r,c).coordinate} (already have {ws.cell(*found[daynum]).coordinate}). Keeping first."
+                prev_r, prev_c, prev_score = found[daynum]
+                if score > prev_score:
+                    msg = f"⚠️  Duplicate day '{daynum}' anchor at {ws.cell(r,c).coordinate} (replacing {ws.cell(prev_r,prev_c).coordinate} due to stronger match)."
+                    found[daynum] = (r, c, score)
+                else:
+                    msg = f"⚠️  Duplicate day '{daynum}' anchor at {ws.cell(r,c).coordinate} (already have {ws.cell(prev_r,prev_c).coordinate}). Keeping first."
                 if cfg.strict:
                     raise ValueError(msg)
-                else:
-                    print(msg)
-                    continue
+                print(msg)
+                continue
 
-            found[daynum] = (r, c)
+            found[daynum] = (r, c, score)
 
     anchors: List[Tuple[date, int, int]] = []
-    for daynum, (r, c) in sorted(found.items(), key=lambda x: x[0]):
+    for daynum, (r, c, _score) in sorted(found.items(), key=lambda x: x[0]):
         anchors.append((date(year, month, daynum), r, c))
     return anchors
 
@@ -247,7 +262,14 @@ def parse_roles_for_day(ws, anchor_r: int, anchor_c: int, cfg: ExportConfig, nex
             t = t.split()[0].replace("-", "")
             if t in PRIMARY_LABELS:
                 if name not in (None, ""):
-                    roles[t] = str(name).strip()
+                    cleaned = str(name).strip()
+                    if t in roles and roles[t] != cleaned:
+                        msg = f"⚠️  Duplicate primary label '{t}' for day block at {ws.cell(anchor_r, anchor_c).coordinate}; keeping first value '{roles[t]}'"
+                        if cfg.strict:
+                            raise ValueError(msg)
+                        print(msg)
+                    else:
+                        roles[t] = cleaned
                 last_primary_row = r
                 continue
 
