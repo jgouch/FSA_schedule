@@ -783,9 +783,12 @@ def build_schedule(config: BuildConfig,
                         continue
 
                     # Pairing guard: require Sat AN to match this Sun PN (including cross-month boundary),
-                    # unless Sunday PN is hard-off on Saturday.
+                    # except when Saturday is a holiday/observed holiday or Sunday PN is hard-off on Saturday.
                     sat = sd - timedelta(days=1)
-                    if who in cons.hard_off.get(sat, set()):
+                    sat_hols = observed_holidays_for_year(sat.year)
+                    if sat in sat_hols or sat in hols:
+                        pass
+                    elif who in cons.hard_off.get(sat, set()):
                         pass
                     elif sat.month == month:
                         if not can_assign_primary(sat, 'AN', who, strict_mode=strict_mode):
@@ -808,7 +811,8 @@ def build_schedule(config: BuildConfig,
 
                     # If Saturday is in-month and open, assign Sat AN to match Sunday PN
                     sat = sd - timedelta(days=1)
-                    if sat.month == month and sat not in hols:
+                    sat_hols = observed_holidays_for_year(sat.year)
+                    if sat.month == month and sat not in hols and sat not in sat_hols:
                         if can_assign_primary(sat, 'AN', who, strict_mode=strict_mode):
                             schedule[sat.isoformat()]['AN'] = who
                             role_counts['AN'][who] += 1
