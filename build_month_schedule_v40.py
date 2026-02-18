@@ -627,26 +627,23 @@ def build_schedule(config: BuildConfig,
         if (d + timedelta(days=1)).month == month and schedule.get((d + timedelta(days=1)).isoformat(), {}).get(role) == name: return False
 
         # Sat AN / Sun PN pairing guard (both directions) to avoid unpaired weekend handoff.
+        # Default: Sat AN must match Sun PN.
+        # Only exception: the Sunday PN person is hard-off on that Saturday.
         if role == 'PN' and is_sunday(d):
             sat = d - timedelta(days=1)
-            sat_hols = observed_holidays_for_year(sat.year)
-            # Exception: if the Sunday PN person is hard-off on Saturday, allow Sat AN ≠ Sun PN.
-            if name in cons.hard_off.get(sat, set()):
-                pass
-            else:
-                if sat not in sat_hols:
-                    if sat.month == month:
-                        sat_an = schedule.get(sat.isoformat(), {}).get('AN')
-                        if sat_an and sat_an != name:
-                            return False
-                    else:
-                        if prev_sched.get(sat.isoformat(), {}).get('AN') != name:
-                            return False
+            if name not in cons.hard_off.get(sat, set()):
+                if sat.month == month:
+                    sat_an = schedule.get(sat.isoformat(), {}).get('AN')
+                    if sat_an and sat_an != name:
+                        return False
+                else:
+                    if prev_sched.get(sat.isoformat(), {}).get('AN') != name:
+                        return False
 
 
         if role == 'AN' and is_saturday(d):
             sun = d + timedelta(days=1)
-            if sun.month == month and sun not in hols:
+            if sun.month == month:
                 sun_pn = schedule.get(sun.isoformat(), {}).get('PN')
                 # Exception: if Sunday PN person is hard-off today (Saturday), allow mismatch.
                 if sun_pn and (sun_pn not in cons.hard_off.get(d, set())) and sun_pn != name:
@@ -773,13 +770,13 @@ def build_schedule(config: BuildConfig,
                     if not can_assign_primary(sd, 'PN', who, strict_mode=strict_mode):
                         continue
 
-                    # Pairing guard: require Sat AN to match this Sun PN (including cross-month boundary)
+                    # Pairing guard: require Sat AN to match this Sun PN (including cross-month boundary),
+                    # unless Sunday PN is hard-off on Saturday.
                     sat = sd - timedelta(days=1)
-                    sat_hols = observed_holidays_for_year(sat.year)
-                    if sat in sat_hols:
+                    if who in cons.hard_off.get(sat, set()):
                         pass
                     elif sat.month == month:
-                        if sat not in hols and (not can_assign_primary(sat, 'AN', who, strict_mode=strict_mode)):
+                        if not can_assign_primary(sat, 'AN', who, strict_mode=strict_mode):
                             continue
                     else:
                         prev_roles = prev_sched.get(sat.isoformat(), {})
