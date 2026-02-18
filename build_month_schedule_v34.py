@@ -141,7 +141,15 @@ def compute_observed_holidays_us(year: int) -> Set[date]:
     d = date(year, 11, 1)
     while d.weekday() != 3: d += timedelta(days=1)
     out.add(d + timedelta(days=21))
-    out.add(date(year, 12, 25))
+
+    # Christmas observed rule (Fri if Saturday holiday, Mon if Sunday holiday)
+    xmas = date(year, 12, 25)
+    if xmas.weekday() == 5:
+        out.add(date(year, 12, 24))
+    elif xmas.weekday() == 6:
+        out.add(date(year, 12, 26))
+    else:
+        out.add(xmas)
     return out
 
 _hols_cache = {}
@@ -170,14 +178,15 @@ def generate_payperiods(anchor_start: date, start_date: date, end_date: date) ->
 def parse_excel_date(value) -> date:
     if isinstance(value, datetime): return value.date()
     if isinstance(value, date): return value
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
         try: return from_excel(value).date()
         except Exception as e: 
             raise ValueError(f"Failed to parse numeric Excel date: {value}. Error: {e}")
     s = str(value).strip()
     for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
         try: return datetime.strptime(s, fmt).date()
-        except: continue
+        except ValueError:
+            continue
     raise ValueError(f"Unrecognized date format: {value!r}")
 
 def _rotate_left(lst: List[str], k: int) -> List[str]:
@@ -249,6 +258,7 @@ def compile_constraints(timeoff: List[TimeOffRule]) -> Constraints:
 def load_timeoff_from_xlsx(xlsx_path: str, sheet_name: str) -> List[TimeOffRule]:
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
     if sheet_name not in wb.sheetnames:
+        wb.close()
         raise ValueError(f"Missing timeoff sheet '{sheet_name}'")
     ws = wb[sheet_name]
     
@@ -285,6 +295,9 @@ def load_timeoff_from_xlsx(xlsx_path: str, sheet_name: str) -> List[TimeOffRule]
         elif sv and ev:
             sd = parse_excel_date(sv)
             ed = parse_excel_date(ev)
+            if ed < sd:
+                wb.close()
+                raise ValueError(f"Invalid time-off range for {name}: start {sd} is after end {ed}")
             cur = sd
             while cur <= ed:
                 dates.append(cur)
@@ -301,6 +314,7 @@ def load_timeoff_from_xlsx(xlsx_path: str, sheet_name: str) -> List[TimeOffRule]
 
         for d in dates:
             rules.append(TimeOffRule(name, d, hard, av))
+    wb.close()
     return rules
 
 def load_roster_from_json(path: str) -> List[str]:
@@ -1138,4 +1152,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
