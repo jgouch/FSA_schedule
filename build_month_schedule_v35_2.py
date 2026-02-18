@@ -261,65 +261,66 @@ def compile_constraints(timeoff: List[TimeOffRule]) -> Constraints:
 
 def load_timeoff_from_xlsx(xlsx_path: str, sheet_name: str) -> List[TimeOffRule]:
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-    if sheet_name not in wb.sheetnames:
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"Missing timeoff sheet '{sheet_name}'")
+        ws = wb[sheet_name]
+
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(1, c).value
+            if v: headers[str(v).strip().lower()] = c
+
+        c_name = headers.get("name")
+        if not c_name:
+            raise ValueError("TimeOff sheet missing 'Name' column")
+        c_date = headers.get("date")
+        c_start = headers.get("start")
+        c_end = headers.get("end")
+        c_hard = headers.get("hard")
+        c_avoid = headers.get("avoidroles")
+
+        def parse_hard(v) -> bool:
+            if v is None or str(v).strip() == "": return True
+            return str(v).strip().lower() in ("true", "1", "yes", "y")
+
+        rules = []
+        for r in range(2, ws.max_row + 1):
+            nv = ws.cell(r, c_name).value
+            if not nv: continue
+            name = norm_name(nv)
+
+            dates = []
+            dv = ws.cell(r, c_date).value if c_date else None
+            sv = ws.cell(r, c_start).value if c_start else None
+            ev = ws.cell(r, c_end).value if c_end else None
+
+            if dv:
+                dates = [parse_excel_date(dv)]
+            elif sv and ev:
+                sd = parse_excel_date(sv)
+                ed = parse_excel_date(ev)
+                if ed < sd:
+                    raise ValueError(f"Invalid time-off range for {name}: start {sd} is after end {ed}")
+                cur = sd
+                while cur <= ed:
+                    dates.append(cur)
+                    cur += timedelta(days=1)
+            else:
+                continue
+
+            hard = parse_hard(ws.cell(r, c_hard).value) if c_hard else True
+            av = set()
+            if c_avoid:
+                val = ws.cell(r, c_avoid).value
+                if val:
+                    av = {p.strip().upper() for p in str(val).split(",") if p.strip()}
+
+            for d in dates:
+                rules.append(TimeOffRule(name, d, hard, av))
+        return rules
+    finally:
         wb.close()
-        raise ValueError(f"Missing timeoff sheet '{sheet_name}'")
-    ws = wb[sheet_name]
-    
-    headers = {}
-    for c in range(1, ws.max_column + 1):
-        v = ws.cell(1, c).value
-        if v: headers[str(v).strip().lower()] = c
-
-    c_name = headers.get("name")
-    if not c_name: raise ValueError("TimeOff sheet missing 'Name' column")
-    c_date = headers.get("date")
-    c_start = headers.get("start")
-    c_end = headers.get("end")
-    c_hard = headers.get("hard")
-    c_avoid = headers.get("avoidroles")
-
-    def parse_hard(v) -> bool:
-        if v is None or str(v).strip() == "": return True
-        return str(v).strip().lower() in ("true", "1", "yes", "y")
-
-    rules = []
-    for r in range(2, ws.max_row + 1):
-        nv = ws.cell(r, c_name).value
-        if not nv: continue
-        name = norm_name(nv)
-        
-        dates = []
-        dv = ws.cell(r, c_date).value if c_date else None
-        sv = ws.cell(r, c_start).value if c_start else None
-        ev = ws.cell(r, c_end).value if c_end else None
-
-        if dv:
-            dates = [parse_excel_date(dv)]
-        elif sv and ev:
-            sd = parse_excel_date(sv)
-            ed = parse_excel_date(ev)
-            if ed < sd:
-                wb.close()
-                raise ValueError(f"Invalid time-off range for {name}: start {sd} is after end {ed}")
-            cur = sd
-            while cur <= ed:
-                dates.append(cur)
-                cur += timedelta(days=1)
-        else:
-            continue
-
-        hard = parse_hard(ws.cell(r, c_hard).value) if c_hard else True
-        av = set()
-        if c_avoid:
-            val = ws.cell(r, c_avoid).value
-            if val:
-                av = {p.strip().upper() for p in str(val).split(",") if p.strip()}
-
-        for d in dates:
-            rules.append(TimeOffRule(name, d, hard, av))
-    wb.close()
-    return rules
 
 def load_roster_from_json(path: str) -> List[str]:
     data = json.loads(Path(path).read_text("utf-8"))
@@ -441,6 +442,9 @@ class BuildConfig:
     rng_seed: int = 11
 
 def compute_primary_targets(days, roster, sales_order, hols):
+    if not roster:
+        raise ValueError("Roster cannot be empty when computing primary targets")
+
     opp = {"PN": 0, "AN": 0, "W": 0}
     for d in days:
         req = roles_required_for_day(d, hols)
@@ -584,7 +588,6 @@ def build_schedule(config: BuildConfig,
     def week_hours(name, d):
         ws = week_start_sun(d)
         tot = 0
-        first_day = date(year, month, 1)
         for i in range(7):
             dd = ws + timedelta(days=i)
             tot += calculate_daily_hours(dd, name, schedule, prev_sched, year, month)
@@ -633,7 +636,6 @@ def build_schedule(config: BuildConfig,
         # cross-month pairing forces next-day Sunday PN. Prevent exceeding max consecutive days.
         before, after = consecutive_span(name, d)
         if role == 'AN' and is_saturday(d) and d.day == calendar.monthrange(year, month)[1] and (before + 2) > config.max_consecutive_days: return False
-        before, after = consecutive_span(name, d)
         if (not is_push_week) and (before + 1 + after) > config.max_consecutive_days: return False
         
         if not (is_holiday_week or is_push_week):
