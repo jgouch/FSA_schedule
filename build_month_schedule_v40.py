@@ -334,8 +334,14 @@ def load_roster_from_json(path: str) -> List[str]:
 
 def load_payperiods_from_json(path: str) -> List[Tuple[date, date]]:
     data = json.loads(Path(path).read_text("utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("Pay periods JSON must be a list of objects with 'start' and 'end'")
     out = []
     for obj in data:
+        if not isinstance(obj, dict):
+            raise ValueError("Each pay period entry must be an object with 'start' and 'end'")
+        if "start" not in obj or "end" not in obj:
+            raise ValueError(f"Pay period entry missing required keys: {obj}")
         s = datetime.strptime(str(obj["start"]).strip(), "%Y-%m-%d").date()
         e = datetime.strptime(str(obj["end"]).strip(), "%Y-%m-%d").date()
         if e < s:
@@ -510,18 +516,6 @@ def build_schedule(config: BuildConfig,
         total_hours = {n: 0 for n in config.roster}
         pn_weekday_counts = {n: {i: 0 for i in range(7)} for n in config.roster}
         monday_pn_used = {n: 0 for n in config.roster}
-
-    def last_role(name, d):
-        for k in range(1, config.lookback_days + 1):
-            p = d - timedelta(days=k)
-            if p.year == year and p.month == month:
-                roles = schedule.get(p.isoformat(), {})
-                for r, n in roles.items():
-                    if n == name: return r
-            else:
-                rr = role_of(prev_sched, p, name)
-                if rr: return rr
-        return None
 
     def consecutive_streak(name, d):
         streak = 0
@@ -776,7 +770,7 @@ def build_schedule(config: BuildConfig,
                         continue
                     if strict_mode and role_counts['PN'][who] >= targets['PN'][who]:
                         continue
-                    if not can_assign_primary(sd, 'PN', who, strict_mode=False):
+                    if not can_assign_primary(sd, 'PN', who, strict_mode=strict_mode):
                         continue
 
                     # Pairing guard: require Sat AN to match this Sun PN (including cross-month boundary)
@@ -785,7 +779,7 @@ def build_schedule(config: BuildConfig,
                     if sat in sat_hols:
                         pass
                     elif sat.month == month:
-                        if sat not in hols and (not can_assign_primary(sat, 'AN', who, strict_mode=False)):
+                        if sat not in hols and (not can_assign_primary(sat, 'AN', who, strict_mode=strict_mode)):
                             continue
                     else:
                         prev_roles = prev_sched.get(sat.isoformat(), {})
@@ -806,7 +800,7 @@ def build_schedule(config: BuildConfig,
                     # If Saturday is in-month and open, assign Sat AN to match Sunday PN
                     sat = sd - timedelta(days=1)
                     if sat.month == month and sat not in hols:
-                        if can_assign_primary(sat, 'AN', who, strict_mode=False):
+                        if can_assign_primary(sat, 'AN', who, strict_mode=strict_mode):
                             schedule[sat.isoformat()]['AN'] = who
                             role_counts['AN'][who] += 1
                             total_hours[who] += 8
