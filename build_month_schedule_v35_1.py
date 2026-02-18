@@ -625,8 +625,14 @@ def build_schedule(config: BuildConfig,
         if is_saturday(d) and (not (week_contains_push(ws_sat, push_days) or week_contains_holiday(ws_sat, hols))) and calculate_daily_hours(d - timedelta(days=7), p, schedule, prev_sched, year, month) != 0: return False
         # Push week relaxation: consecutive-days cap not enforced during push week
         
-        # BU back-to-back should be SOFT only (randomization), never a hard block.
-        # (Soft preference handled in bu_score via small penalties.)
+        # HARD block: no same BU label on consecutive days for the same person
+        # (BU1->BU1, BU2->BU2, etc. are forbidden; BU1->BU2 remains allowed).
+        prev_d = d - timedelta(days=1)
+        prev_roles = schedule.get(prev_d.isoformat(), {})
+        if prev_d.month != month:
+            prev_roles = prev_sched.get(prev_d.isoformat(), {})
+        if prev_roles.get(role) == p:
+            return False
 
         ws = week_start_sun(d)
         is_push = week_contains_push(ws, push_days)
@@ -812,7 +818,7 @@ def build_schedule(config: BuildConfig,
         if had_any_bu_yday:
             s -= 5.0   # small nudge away from consecutive BU days
         if had_same_bu_slot_yday:
-            s -= 10.0  # stronger nudge away from same BU# on consecutive days
+            s -= 10.0  # safety nudge if can_bu rules are ever relaxed again
         return s
 
     def solve_bu(idx):
