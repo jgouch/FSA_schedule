@@ -967,16 +967,20 @@ def build_schedule(config: BuildConfig,
         
         for p in cands:
             schedule[d.isoformat()][role] = p
-        total_hours[p] += 8
-        if role == 'BU1':
-            bu1_counts[p] += 1
-            bu1_weekday_counts[p][weekday_sun0(d)] += 1
-            if solve_bu(idx + 1): return True
+            total_hours[p] += 8
+            if role == 'BU1':
+                bu1_counts[p] += 1
+                bu1_weekday_counts[p][weekday_sun0(d)] += 1
+
+            if solve_bu(idx + 1):
+                return True
+
             del schedule[d.isoformat()][role]
-        total_hours[p] -= 8
-        if role == 'BU1':
-            bu1_counts[p] -= 1
-            bu1_weekday_counts[p][weekday_sun0(d)] -= 1
+            total_hours[p] -= 8
+            if role == 'BU1':
+                bu1_counts[p] -= 1
+                bu1_weekday_counts[p][weekday_sun0(d)] -= 1
+
         return False
 
     if not solve_bu(0):
@@ -1007,10 +1011,10 @@ def build_schedule(config: BuildConfig,
             cands.sort(key=lambda person: bu_score(d, role, person), reverse=True)
             pick = cands[0]
             schedule[d_iso][role] = pick
-        total_hours[pick] += 8
-        if role == 'BU1':
-            bu1_counts[pick] += 1
-            bu1_weekday_counts[pick][weekday_sun0(d)] += 1
+            total_hours[pick] += 8
+            if role == 'BU1':
+                bu1_counts[pick] += 1
+                bu1_weekday_counts[pick][weekday_sun0(d)] += 1
         # --- end greedy fallback ---
     # print("Warning: Could not fill all desired BU slots.")
     print("\n--- Schedule Fairness Audit ---")
