@@ -631,7 +631,12 @@ def build_schedule(config: BuildConfig,
         # Only exception: the Sunday PN person is hard-off on that Saturday.
         if role == 'PN' and is_sunday(d):
             sat = d - timedelta(days=1)
-            if name not in cons.hard_off.get(sat, set()):
+            sat_hols = observed_holidays_for_year(sat.year)
+            if sat in sat_hols or sat in hols:
+                pass
+            elif name in cons.hard_off.get(sat, set()):
+                pass
+            else:
                 if sat.month == month:
                     sat_an = schedule.get(sat.isoformat(), {}).get('AN')
                     if sat_an and sat_an != name:
@@ -643,11 +648,18 @@ def build_schedule(config: BuildConfig,
 
         if role == 'AN' and is_saturday(d):
             sun = d + timedelta(days=1)
-            if sun.month == month:
+            sun_hols = observed_holidays_for_year(sun.year)
+            if sun in hols or sun in sun_hols:
+                pass
+            elif sun.month == month:
                 sun_pn = schedule.get(sun.isoformat(), {}).get('PN')
                 # Exception: if Sunday PN person is hard-off today (Saturday), allow mismatch.
+                # Sanity example: Feb 21 hard-off for Greg allows Sun 22 PN=Greg without forcing Sat 21 AN=Greg.
                 if sun_pn and (sun_pn not in cons.hard_off.get(d, set())) and sun_pn != name:
                     return False
+            else:
+                # Cross-month: Sunday is in next month; pairing is validated when that month is built.
+                pass
 
 
         # Push week relaxation: consecutive-days cap not enforced during push week
