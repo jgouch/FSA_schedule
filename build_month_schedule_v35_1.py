@@ -123,7 +123,11 @@ def parse_month_arg(s: str) -> Tuple[int, int]:
     m = re.match(r"^\s*(\d{4})-(\d{2})\s*$", s)
     if not m:
         raise ValueError("Month must be YYYY-MM, e.g. 2026-02")
-    return int(m.group(1)), int(m.group(2))
+    year = int(m.group(1))
+    month = int(m.group(2))
+    if not 1 <= month <= 12:
+        raise ValueError(f"Month out of range in '{s}'. Expected 01..12")
+    return year, month
 
 def compute_observed_holidays_us(year: int) -> Set[date]:
     out: Set[date] = set()
@@ -337,40 +341,43 @@ def load_payperiods_from_json(path: str) -> List[Tuple[date, date]]:
 
 def load_sales_ranking_from_timeoff_xlsx(xlsx_path, sheet_name, year, month, roster_names):
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-    if sheet_name not in wb.sheetnames:
-        raise ValueError(f"Missing sheet '{sheet_name}'")
-    ws = wb[sheet_name]
-    target = normalize_quarter_key(quarter_tag_for_month(year, month))
-    
-    rows = {}
-    for r in range(2, ws.max_row + 1):
-        p = ws.cell(r, 1).value
-        if not p: continue
-        p = normalize_quarter_key(str(p)) 
-        ranks = []
-        for c in range(2, ws.max_column + 1):
-            v = ws.cell(r, c).value
-            if v and str(v).strip():
-                ranks.append(norm_name(v))
-        if ranks: rows[p] = ranks
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"Missing sheet '{sheet_name}'")
+        ws = wb[sheet_name]
+        target = normalize_quarter_key(quarter_tag_for_month(year, month))
 
-    def key(x):
-        m = re.match(r"^\s*(\d{4})\s*Q([1-4])\s*$", x)
-        return (int(m.group(1)), int(m.group(2))) if m else (0,0)
+        rows = {}
+        for r in range(2, ws.max_row + 1):
+            p = ws.cell(r, 1).value
+            if not p: continue
+            p = normalize_quarter_key(str(p))
+            ranks = []
+            for c in range(2, ws.max_column + 1):
+                v = ws.cell(r, c).value
+                if v and str(v).strip():
+                    ranks.append(norm_name(v))
+            if ranks: rows[p] = ranks
 
-    order = rows.get(target)
-    if not order:
-        candidates = sorted(rows.keys(), key=key)
-        if candidates: order = rows[candidates[-1]]
-    
-    roster_set = set(roster_names)
-    if not order:
-        return [n for n in SENIORITY_ORDER if n in roster_set] + [n for n in roster_names if n not in SENIORITY_ORDER]
-    
-    order = [x for x in order if x in roster_set]
-    missing = roster_set - set(order)
-    order.extend(sorted(list(missing)))
-    return order
+        def key(x):
+            m = re.match(r"^\s*(\d{4})\s*Q([1-4])\s*$", x)
+            return (int(m.group(1)), int(m.group(2))) if m else (0,0)
+
+        order = rows.get(target)
+        if not order:
+            candidates = sorted(rows.keys(), key=key)
+            if candidates: order = rows[candidates[-1]]
+
+        roster_set = set(roster_names)
+        if not order:
+            return [n for n in SENIORITY_ORDER if n in roster_set] + [n for n in roster_names if n not in SENIORITY_ORDER]
+
+        order = [x for x in order if x in roster_set]
+        missing = roster_set - set(order)
+        order.extend(sorted(list(missing)))
+        return order
+    finally:
+        wb.close()
 
 def load_schedule_json(path: str) -> Dict[str, Dict[str, str]]:
     data = json.loads(Path(path).read_text("utf-8"))
@@ -618,14 +625,6 @@ def build_schedule(config: BuildConfig,
         if is_saturday(d) and (not (week_contains_push(ws_sat, push_days) or week_contains_holiday(ws_sat, hols))) and calculate_daily_hours(d - timedelta(days=7), p, schedule, prev_sched, year, month) != 0: return False
         # Push week relaxation: consecutive-days cap not enforced during push week
         
-        # B2B (Same Role) for BU should mean previous CALENDAR day, not previous WORKED role
-        prev_d = d - timedelta(days=1)
-        prev_roles = schedule.get(prev_d.isoformat(), {})
-        if prev_d.month != month:
-            prev_roles = prev_sched.get(prev_d.isoformat(), {})
-        # Hard block: BU same-label back-to-back across calendar days (order-independent)
-        if prev_roles.get(role) == p: return False
-        if ((schedule.get((d + timedelta(days=1)).isoformat(), {}) if (d + timedelta(days=1)).month == month else prev_sched.get((d + timedelta(days=1)).isoformat(), {}))).get(role) == p: return False
         # BU back-to-back should be SOFT only (randomization), never a hard block.
         # (Soft preference handled in bu_score via small penalties.)
 
