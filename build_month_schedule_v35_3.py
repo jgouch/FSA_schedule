@@ -326,7 +326,11 @@ def load_roster_from_json(path: str) -> List[str]:
     data = json.loads(Path(path).read_text("utf-8"))
     if not isinstance(data, list) or not data:
         raise ValueError("Roster JSON must be a non-empty list of names")
-    return [norm_name(x) for x in data if str(x).strip()]
+
+    roster = [norm_name(x) for x in data if str(x).strip()]
+    if not roster:
+        raise ValueError("Roster JSON must contain at least one non-blank name")
+    return roster
 
 def load_payperiods_from_json(path: str) -> List[Tuple[date, date]]:
     data = json.loads(Path(path).read_text("utf-8"))
@@ -361,7 +365,8 @@ def load_sales_ranking_from_timeoff_xlsx(xlsx_path, sheet_name, year, month, ros
             if ranks: rows[p] = ranks
 
         def key(x):
-            m = re.match(r"^\s*(\d{4})\s*Q([1-4])\s*$", x)
+            # Support both raw values ("2026 Q1") and normalized values ("2026Q1").
+            m = re.match(r"^(\d{4})Q([1-4])$", normalize_quarter_key(x))
             return (int(m.group(1)), int(m.group(2))) if m else (0,0)
 
         order = rows.get(target)
@@ -626,6 +631,26 @@ def build_schedule(config: BuildConfig,
             prev_roles = prev_sched.get(prev_d.isoformat(), {})
         if prev_roles.get(role) == name: return False
         if (d + timedelta(days=1)).month == month and schedule.get((d + timedelta(days=1)).isoformat(), {}).get(role) == name: return False
+
+        # Sat AN / Sun PN pairing guard (both directions) to avoid unpaired weekend handoff.
+        if role == 'PN' and is_sunday(d):
+            sat = d - timedelta(days=1)
+            sat_hols = observed_holidays_for_year(sat.year)
+            if sat not in sat_hols:
+                if sat.month == month:
+                    sat_an = schedule.get(sat.isoformat(), {}).get('AN')
+                    if sat_an and sat_an != name:
+                        return False
+                else:
+                    if prev_sched.get(sat.isoformat(), {}).get('AN') != name:
+                        return False
+
+        if role == 'AN' and is_saturday(d):
+            sun = d + timedelta(days=1)
+            if sun.month == month and sun not in hols:
+                sun_pn = schedule.get(sun.isoformat(), {}).get('PN')
+                if sun_pn and sun_pn != name:
+                    return False
         
         # Push week relaxation: consecutive-days cap not enforced during push week
         
