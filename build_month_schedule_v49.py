@@ -1625,10 +1625,7 @@ def main():
                 seed_end = min(seed_end, seed_start + args.max_attempts - 1)
 
         if seed_start > seed_end:
-            raise ValueError(
-                "Resolved seed range is empty: ensure --seed-start <= --seed-end "
-                "(after applying --max-attempts if provided)."
-            )
+            raise ValueError("Resolved seed range is empty: ensure --seed-start <= --seed-end")
 
         for d in month_days(year, month):
             if d in hols or not is_weekday(d):
