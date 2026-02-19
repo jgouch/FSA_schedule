@@ -115,6 +115,10 @@ def quarter_tag_for_month(year: int, month: int) -> str:
 def norm_name(x) -> str:
     return re.sub(r"\s+", " ", str(x).strip())
 
+def _normalize_header_key(value: str) -> str:
+    """Normalize column headers so minor spacing/punctuation differences still match."""
+    return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
+
 def normalize_quarter_key(s: str) -> str:
     """Normalize '2026 Q1' -> '2026Q1'."""
     return re.sub(r"\s+", "", str(s).strip().upper())
@@ -269,7 +273,8 @@ def load_timeoff_from_xlsx(xlsx_path: str, sheet_name: str) -> List[TimeOffRule]
         headers = {}
         for c in range(1, ws.max_column + 1):
             v = ws.cell(1, c).value
-            if v: headers[str(v).strip().lower()] = c
+            if v:
+                headers[_normalize_header_key(v)] = c
 
         c_name = headers.get("name")
         if not c_name:
@@ -315,6 +320,11 @@ def load_timeoff_from_xlsx(xlsx_path: str, sheet_name: str) -> List[TimeOffRule]
                 val = ws.cell(r, c_avoid).value
                 if val:
                     av = {p.strip().upper() for p in str(val).split(",") if p.strip()}
+                    invalid = av - set(ROLE_PRIMARY + ROLE_BUS)
+                    if invalid:
+                        raise ValueError(
+                            f"Unknown role(s) in AvoidRoles for {name} on row {r}: {sorted(invalid)}"
+                        )
 
             for d in dates:
                 rules.append(TimeOffRule(name, d, hard, av))
