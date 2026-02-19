@@ -742,6 +742,8 @@ def build_schedule(config: BuildConfig,
 
     def run_solver(strict_mode: bool) -> bool:
         sundays = [d for d in days if is_sunday(d) and d not in hols]
+        month_sunday_count = {p: 0 for p in config.roster}
+        sunday_month_dup_used = False
 
         # 6-week rolling Sunday PN rotation across months, driven by actual prior schedules
         # This continues from the last actual Sunday PN in prev_sched, so manual edits are respected.
@@ -769,11 +771,16 @@ def build_schedule(config: BuildConfig,
         for sd in sundays:
             assigned_sunday = False
             recent_set = set(recent_sundays)
-            # Two-pass selection: first enforce 6-week rotation, then allow repeats only if necessary.
-            for allow_recent in (False, True):
+            # Three-pass selection:
+            #   A) strict rotation + no month duplicate
+            #   B) relaxed rotation + no month duplicate
+            #   C) relaxed rotation + allow month duplicate (last resort)
+            for allow_recent, allow_month_dup in ((False, False), (True, False), (True, True)):
                 for offset in range(len(config.roster)):
                     who = config.roster[(rot_idx + offset) % len(config.roster)]
                     if (not allow_recent) and (who in recent_set):
+                        continue
+                    if (not allow_month_dup) and month_sunday_count[who] >= 1:
                         continue
                     if who in cons.hard_off.get(sd, set()):
                         continue
@@ -804,6 +811,9 @@ def build_schedule(config: BuildConfig,
                     role_counts['PN'][who] += 1
                     total_hours[who] += 5
                     pn_weekday_counts[who][0] += 1
+                    month_sunday_count[who] += 1
+                    if allow_month_dup:
+                        sunday_month_dup_used = True
                     assigned_sunday = True
                     # Advance rotation based on actual assignment
                     rot_idx = (config.roster.index(who) + 1) % len(config.roster)
@@ -821,6 +831,10 @@ def build_schedule(config: BuildConfig,
                 if assigned_sunday:
                     break
             if not assigned_sunday and strict_mode:
+                return False
+
+        if strict_mode and not sunday_month_dup_used:
+            if any(cnt > 1 for cnt in month_sunday_count.values()):
                 return False
 
 
@@ -1287,6 +1301,16 @@ def write_violations_tab(wb, schedule, year, month, roster, targets, cons, prev_
 
     # 3. Hours Audit
     audit_hours_caps(ws_vio, roster, week_starts, payperiods, hols, push_days, schedule, prev_sched, year, month)
+
+    # 4. Sunday Duplicate Audit
+    sunday_counts = {p: 0 for p in roster}
+    for d_iso, rmap in schedule.items():
+        d = date.fromisoformat(d_iso)
+        if is_sunday(d) and rmap.get("PN"):
+            sunday_counts[rmap["PN"]] += 1
+    for person, cnt in sunday_counts.items():
+        if cnt > 1:
+            ws_vio.append(["Sunday Duplicate", person, f"Assigned Sunday PN {cnt} times in {year}-{month:02d}"])
 
 
 def export_to_excel(schedule, year, month, out_path, roster, hols, prev_sched,
