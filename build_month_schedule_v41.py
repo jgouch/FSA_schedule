@@ -920,14 +920,20 @@ def build_schedule(config: BuildConfig,
     # --- end BU1 fairness ---
 
 # --- BU FILL ---
+    def ideal_bu_roles_for_day(d: date) -> List[str]:
+        if d in hols:
+            return []
+        if d in push_days:
+            return ["BU1", "BU2", "BU3", "BU4"] if is_saturday(d) else ["BU1", "BU2", "BU3"]
+        if weekday_sun0(d) == 1:
+            return ["BU1", "BU2", "BU3"]  # Mon
+        if is_weekday(d):
+            return ["BU1", "BU2"]  # Tue-Fri
+        return []
+
     bu_queue = []
     for d in days:
-        if d in hols: continue
-        ideal = []
-        if d in push_days:
-            ideal = ["BU1", "BU2", "BU3", "BU4"] if is_saturday(d) else ["BU1", "BU2", "BU3"]
-        elif weekday_sun0(d) == 1: ideal = ["BU1", "BU2", "BU3"] # Mon
-        elif is_weekday(d): ideal = ["BU1", "BU2"] # Tue-Fri
+        ideal = ideal_bu_roles_for_day(d)
         
         if not ideal: continue
 
@@ -1033,7 +1039,11 @@ def build_schedule(config: BuildConfig,
 
     # --- BU REPAIR PASS (BU2/BU3 only) ---
     bu_repair_swaps = []
-    deficits = [(d, role) for (d, role) in bu_queue if role in {'BU2', 'BU3'} and role not in schedule[d.isoformat()]]
+    deficits = []
+    for d in days:
+        for role in ideal_bu_roles_for_day(d):
+            if role in {'BU2', 'BU3'} and role not in schedule[d.isoformat()]:
+                deficits.append((d, role))
     before_deficits = len(deficits)
 
     for d, role in deficits:
@@ -1139,7 +1149,11 @@ def build_schedule(config: BuildConfig,
             if fixed:
                 break
 
-    remaining_deficits = [(d, role) for (d, role) in bu_queue if role in {'BU2', 'BU3'} and role not in schedule[d.isoformat()]]
+    remaining_deficits = []
+    for d in days:
+        for role in ideal_bu_roles_for_day(d):
+            if role in {'BU2', 'BU3'} and role not in schedule[d.isoformat()]:
+                remaining_deficits.append((d, role))
     after_deficits = len(remaining_deficits)
     print("\n--- BU Repair Pass Summary ---")
     print(f"BU2/BU3 deficits before repair: {before_deficits}")
