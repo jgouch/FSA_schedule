@@ -919,7 +919,7 @@ def build_schedule(config: BuildConfig,
     enforce_bu1_cap = True
     # --- end BU1 fairness ---
 
-# --- BU FILL ---
+    # --- BU FILL ---
     def ideal_bu_roles_for_day(d: date) -> List[str]:
         if d in hols:
             return []
