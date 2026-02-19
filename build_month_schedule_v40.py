@@ -1034,11 +1034,15 @@ def build_schedule(config: BuildConfig,
     # --- BU REPAIR PASS (BU2/BU3 only) ---
     bu_repair_swaps = []
     deficits = [(d, role) for (d, role) in bu_queue if role in {'BU2', 'BU3'} and role not in schedule[d.isoformat()]]
+    before_deficits = len(deficits)
 
     for d, role in deficits:
         d_iso = d.isoformat()
         if role in schedule[d_iso]:
             continue
+
+        ws = week_start_sun(d)
+        is_relaxed_week = week_contains_push(ws, push_days) or week_contains_holiday(ws, hols)
 
         # Easy win first: direct assignment if someone already passes all checks.
         direct_cands = [p for p in config.roster if can_bu(d, role, p)]
@@ -1055,8 +1059,10 @@ def build_schedule(config: BuildConfig,
             })
             continue
 
+        if is_relaxed_week:
+            continue
+
         # Single-swap augmenting attempt (same-week only).
-        ws = week_start_sun(d)
         week_days = [ws + timedelta(days=i) for i in range(7)]
 
         fixed = False
@@ -1134,9 +1140,10 @@ def build_schedule(config: BuildConfig,
                 break
 
     remaining_deficits = [(d, role) for (d, role) in bu_queue if role in {'BU2', 'BU3'} and role not in schedule[d.isoformat()]]
+    after_deficits = len(remaining_deficits)
     print("\n--- BU Repair Pass Summary ---")
-    print(f"BU2/BU3 deficits before repair: {len(deficits)}")
-    print(f"BU2/BU3 deficits after repair: {len(remaining_deficits)}")
+    print(f"BU2/BU3 deficits before repair: {before_deficits}")
+    print(f"BU2/BU3 deficits after repair: {after_deficits}")
     if bu_repair_swaps:
         for item in bu_repair_swaps:
             if item["type"] == "direct":
