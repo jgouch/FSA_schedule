@@ -1222,15 +1222,18 @@ def validate_min_weekday_staff(
     hols: Set[date],
     min_staff: int = 4,
 ) -> Tuple[bool, str]:
-    for d in month_days(year, month):
-        if d in hols or not is_weekday(d):
+    """Validate minimum unique weekday staffing coverage for the built schedule."""
+    for day in month_days(year, month):
+        if day in hols or not is_weekday(day):
             continue
-        assigned_people = set(schedule.get(d.isoformat(), {}).values())
+
+        day_key = day.isoformat()
+        day_roles = schedule.get(day_key, {})
+        assigned_people = set(day_roles.values())
         if len(assigned_people) < min_staff:
-            day_roles = schedule.get(d.isoformat(), {})
             return (
                 False,
-                f"Weekday understaffed: {d.isoformat()} has {len(assigned_people)} unique people (<{min_staff}); roles={day_roles}",
+                f"Weekday understaffed: {day_key} has {len(assigned_people)} unique people (<{min_staff}); roles={day_roles}",
             )
 
     return True, "OK"
