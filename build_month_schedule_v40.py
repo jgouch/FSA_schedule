@@ -1030,6 +1030,125 @@ def build_schedule(config: BuildConfig,
                 bu1_counts[pick] += 1
                 bu1_weekday_counts[pick][weekday_sun0(d)] += 1
         # --- end greedy fallback ---
+
+    # --- BU REPAIR PASS (BU2/BU3 only) ---
+    bu_repair_swaps = []
+    deficits = [(d, role) for (d, role) in bu_queue if role in {'BU2', 'BU3'} and role not in schedule[d.isoformat()]]
+
+    for d, role in deficits:
+        d_iso = d.isoformat()
+        if role in schedule[d_iso]:
+            continue
+
+        # Easy win first: direct assignment if someone already passes all checks.
+        direct_cands = [p for p in config.roster if can_bu(d, role, p)]
+        if direct_cands:
+            direct_cands.sort(key=lambda person: bu_score(d, role, person), reverse=True)
+            pick = direct_cands[0]
+            schedule[d_iso][role] = pick
+            total_hours[pick] += 8
+            bu_repair_swaps.append({
+                "type": "direct",
+                "deficit_day": d_iso,
+                "deficit_role": role,
+                "assigned": pick,
+            })
+            continue
+
+        # Single-swap augmenting attempt (same-week only).
+        ws = week_start_sun(d)
+        week_days = [ws + timedelta(days=i) for i in range(7)]
+
+        fixed = False
+        for p in config.roster:
+            # Candidate for deficit day must be free and not hard-off.
+            if p in schedule[d_iso].values():
+                continue
+            if p in cons.hard_off.get(d, set()):
+                continue
+
+            # Try to free one BU2/BU3 assignment for p inside the same week.
+            move_options = []
+            for d2 in week_days:
+                d2_iso = d2.isoformat()
+                if d2_iso not in schedule:
+                    continue
+                for moved_role in ('BU2', 'BU3'):
+                    if schedule[d2_iso].get(moved_role) == p:
+                        move_options.append((d2, moved_role))
+
+            if not move_options:
+                continue
+
+            for d2, moved_role in move_options:
+                d2_iso = d2.isoformat()
+
+                # Find receiver q for p's moved BU slot.
+                q_cands = []
+                for q in config.roster:
+                    if q == p:
+                        continue
+                    if q in schedule[d2_iso].values():
+                        continue
+                    if q in cons.hard_off.get(d2, set()):
+                        continue
+                    if can_bu(d2, moved_role, q):
+                        q_cands.append(q)
+
+                if not q_cands:
+                    continue
+
+                q_cands.sort(key=lambda person: bu_score(d2, moved_role, person), reverse=True)
+
+                for q in q_cands:
+                    # Tentative move: d2 moved_role from p -> q
+                    schedule[d2_iso][moved_role] = q
+                    total_hours[p] -= 8
+                    total_hours[q] += 8
+
+                    # After freeing p's load, try filling deficit.
+                    if can_bu(d, role, p):
+                        schedule[d_iso][role] = p
+                        total_hours[p] += 8
+                        bu_repair_swaps.append({
+                            "type": "swap",
+                            "deficit_day": d_iso,
+                            "deficit_role": role,
+                            "filled_by": p,
+                            "moved_day": d2_iso,
+                            "moved_role": moved_role,
+                            "moved_from": p,
+                            "moved_to": q,
+                        })
+                        fixed = True
+                        break
+
+                    # Rollback tentative move.
+                    schedule[d2_iso][moved_role] = p
+                    total_hours[p] += 8
+                    total_hours[q] -= 8
+
+                if fixed:
+                    break
+            if fixed:
+                break
+
+    remaining_deficits = [(d, role) for (d, role) in bu_queue if role in {'BU2', 'BU3'} and role not in schedule[d.isoformat()]]
+    print("\n--- BU Repair Pass Summary ---")
+    print(f"BU2/BU3 deficits before repair: {len(deficits)}")
+    print(f"BU2/BU3 deficits after repair: {len(remaining_deficits)}")
+    if bu_repair_swaps:
+        for item in bu_repair_swaps:
+            if item["type"] == "direct":
+                print(f"[DIRECT] Filled {item['deficit_role']} on {item['deficit_day']} with {item['assigned']}")
+            else:
+                print(
+                    f"[SWAP] Filled {item['deficit_role']} on {item['deficit_day']} with {item['filled_by']} "
+                    f"by moving {item['moved_role']} on {item['moved_day']} from {item['moved_from']} to {item['moved_to']}"
+                )
+    else:
+        print("No BU2/BU3 repair swaps performed.")
+
     # print("Warning: Could not fill all desired BU slots.")
     print("\n--- Schedule Fairness Audit ---")
     print(f"{'Name':<10} {'PN (Tgt)':<10} {'AN':<5} {'W':<5} {'TotHrs':<8}")
