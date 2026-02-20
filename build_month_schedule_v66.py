@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v65.py
+build_month_schedule_v66.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -46,6 +46,7 @@ Logic Changes (v34):
 - FIX (v62): primary swap micro-pass final failure return moved outside candidate loop (correct indentation).
 - FIX (v64): primary swap micro-pass final failure block truly moved outside the candidate loop (corrected indentation).
 - FIX (v65): Dynamic staffing scaling for changing roster size + support FSA Schedule Info.xlsx workbook conventions (Roster/Sales Ranking/month request sheets).
+- FIX (v66): Dynamic BU role scaling across changing roster sizes (no BU4 for 5-person teams) + repair pass counter correctness for BU fairness.
 """
 
 from __future__ import annotations
@@ -611,27 +612,34 @@ def ideal_bu_roles_for_day(d: date, roster_size: int) -> List[str]:
         return []
     if is_sunday(d):
         return []
+
     is_push_day = d in get_push_days_for_month(d.year, d.month)
+    is_monday = weekday_sun0(d) == 1
+    bu1_bu2 = ["BU1", "BU2"]
+    bu1_bu2_bu3 = ["BU1", "BU2", "BU3"]
+
+    if is_saturday(d):
+        if not is_push_day:
+            return []
+        if roster_size <= 5:
+            return bu1_bu2_bu3
+        return ["BU1", "BU2", "BU3", "BU4"]
+
     if roster_size <= 5:
         if is_push_day:
-            if is_saturday(d):
-                return ["BU1", "BU2", "BU4"]
-            if weekday_sun0(d) in {1, 2, 3, 4, 5}:
-                return ["BU1", "BU2"]
-        if weekday_sun0(d) == 1:
-            return ["BU1", "BU2"]
+            return bu1_bu2
+        if is_monday:
+            return bu1_bu2
         if is_weekday(d):
             return ["BU1"]
         return []
 
     if is_push_day:
-        if is_saturday(d):
-            return ["BU1", "BU2", "BU3", "BU4"]
-        return ["BU1", "BU2", "BU3"]
-    if weekday_sun0(d) == 1:
-        return ["BU1", "BU2", "BU3"]
+        return bu1_bu2_bu3
+    if is_monday:
+        return bu1_bu2_bu3
     if is_weekday(d):
-        return ["BU1", "BU2"]
+        return bu1_bu2
     return []
 
 @dataclass
@@ -1124,8 +1132,9 @@ def build_schedule(config: BuildConfig,
     def remove_bu_count(d: date, role: str, person: str):
         if role not in bu_counts:
             return
-        bu_counts[role][person] -= 1
-        bu_weekday_counts[role][person][weekday_sun0(d)] -= 1
+        bu_counts[role][person] = max(0, bu_counts[role][person] - 1)
+        wd = weekday_sun0(d)
+        bu_weekday_counts[role][person][wd] = max(0, bu_weekday_counts[role][person][wd] - 1)
 
     # --- BU FILL ---
     bu_queue = []
@@ -1231,7 +1240,7 @@ def build_schedule(config: BuildConfig,
 
     # --- BU REPAIR PASS ---
     bu_repair_swaps = []
-    repair_roles = {"BU2", "BU4"} if roster_size <= 5 else {"BU2", "BU3"}
+    repair_roles = {"BU2", "BU3"}
     deficits = []
     for d in days:
         expected = ideal_bu_roles_for_day(d, roster_size)
@@ -1255,6 +1264,7 @@ def build_schedule(config: BuildConfig,
             pick = direct_cands[0]
             schedule[d_iso][role] = pick
             total_hours[pick] += 8
+            add_bu_count(d, role, pick)
             bu_repair_swaps.append({
                 "type": "direct",
                 "deficit_day": d_iso,
@@ -1315,11 +1325,14 @@ def build_schedule(config: BuildConfig,
                     schedule[d2_iso][moved_role] = q
                     total_hours[p] -= 8
                     total_hours[q] += 8
+                    remove_bu_count(d2, moved_role, p)
+                    add_bu_count(d2, moved_role, q)
 
                     # After freeing p's load, try filling deficit.
                     if can_bu(d, role, p):
                         schedule[d_iso][role] = p
                         total_hours[p] += 8
+                        add_bu_count(d, role, p)
                         bu_repair_swaps.append({
                             "type": "swap",
                             "deficit_day": d_iso,
@@ -1337,6 +1350,8 @@ def build_schedule(config: BuildConfig,
                     schedule[d2_iso][moved_role] = p
                     total_hours[p] += 8
                     total_hours[q] -= 8
+                    remove_bu_count(d2, moved_role, q)
+                    add_bu_count(d2, moved_role, p)
 
                 if fixed:
                     break
@@ -1818,7 +1833,7 @@ def bu_deficit_metrics(
     total_bu_missing = 0
     bu2_bu3_missing = 0
     bu3_missing = 0
-    tracked_roles = {"BU2", "BU4"} if roster_size <= 5 else {"BU2", "BU3"}
+    tracked_roles = {"BU2", "BU3"}
 
     for d in month_days(year, month):
         day_roles = schedule.get(d.isoformat(), {})
