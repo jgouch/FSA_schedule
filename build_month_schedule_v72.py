@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v71.py
+build_month_schedule_v72.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -52,6 +52,7 @@ Logic Changes (v34):
 - FIX (v69): BU1 targets now use primary remainder rotation (PN->AN->W->BU1) to keep BU1 distribution aligned with primary fairness.
 - FIX (v70): Auto-seed now enforces target weekday staffing when available by default (robust 4-when-available search).
 - FIX (v71): Restore dynamic default target_weekday_staff (scales with roster size) while keeping auto-seed enforcement default.
+- FIX (v72): Fix Sales Ranking quarter regex; ignore blank/None values in staffing validators; normalize prev-schedule names for Sunday rotation and cross-month comparisons.
 """
 
 from __future__ import annotations
@@ -739,6 +740,7 @@ def build_schedule(config: BuildConfig,
     year, month = config.year, config.month
     days = month_days(year, month)
     roster_set = {norm_name(person) for person in config.roster}
+    roster_map = {norm_name(person): person for person in config.roster}
     
     hols = observed_holidays_for_year(year)
     targets = compute_primary_targets(days, config.roster, config.sales_order, hols)
@@ -883,12 +885,13 @@ def build_schedule(config: BuildConfig,
                     if sat_an and sat_an != name:
                         return False
                 else:
-                    prev_an = prev_sched.get(sat.isoformat(), {}).get('AN')
-                    if prev_an is None or str(prev_an).strip() == '':
+                    prev_an_raw = prev_sched.get(sat.isoformat(), {}).get('AN')
+                    if prev_an_raw is None or str(prev_an_raw).strip() == '':
                         pass
                     else:
-                        prev_an_norm = norm_name(prev_an)
-                        if prev_an_norm in roster_set and prev_an_norm != name:
+                        prev_an_norm = norm_name(prev_an_raw)
+                        prev_an_canon = roster_map.get(prev_an_norm)
+                        if prev_an_canon and prev_an_canon != name:
                             return False
 
 
@@ -1001,8 +1004,10 @@ def build_schedule(config: BuildConfig,
             xd = datetime.strptime(x, '%Y-%m-%d').date()
             if not is_sunday(xd):
                 continue
-            r = prev_sched.get(x, {}).get('PN')
-            if r in config.roster:
+            r_raw = prev_sched.get(x, {}).get('PN')
+            r_norm = norm_name(r_raw)
+            r = roster_map.get(r_norm)
+            if r:
                 if prev_pn is None:
                     prev_pn = r
                 recent_sundays.appendleft(r)
@@ -1048,12 +1053,13 @@ def build_schedule(config: BuildConfig,
                             continue
                     else:
                         prev_roles = prev_sched.get(sat.isoformat(), {})
-                        prev_an = prev_roles.get('AN')
-                        if prev_an is None or str(prev_an).strip() == '':
+                        prev_an_raw = prev_roles.get('AN')
+                        if prev_an_raw is None or str(prev_an_raw).strip() == '':
                             pass
                         else:
-                            prev_an_norm = norm_name(prev_an)
-                            if prev_an_norm in roster_set and prev_an_norm != who:
+                            prev_an_norm = norm_name(prev_an_raw)
+                            prev_an_canon = roster_map.get(prev_an_norm)
+                            if prev_an_canon and prev_an_canon != who:
                                 continue
 
                     # Assign Sunday PN
@@ -1824,7 +1830,7 @@ def validate_min_weekday_staff(
 
         day_key = day.isoformat()
         day_roles = schedule.get(day_key, {})
-        assigned_people = set(day_roles.values())
+        assigned_people = {v for v in day_roles.values() if v is not None and str(v).strip() != ""}
         available_count = len(roster) - len(cons.hard_off.get(day, set()))
         effective_min = min(min_staff, available_count)
         if len(assigned_people) < effective_min:
@@ -1858,7 +1864,7 @@ def weekday_staff_metrics(
             continue
 
         eligible_weekdays_checked += 1
-        assigned_count = len(set(schedule.get(d.isoformat(), {}).values()))
+        assigned_count = len({v for v in schedule.get(d.isoformat(), {}).values() if v is not None and str(v).strip() != ""})
         if (
             eligible_min_assigned_on_weekday is None
             or assigned_count < eligible_min_assigned_on_weekday
@@ -1980,7 +1986,7 @@ def validate_target_when_available(
             continue
         available = len(roster) - len(cons.hard_off.get(d, set()))
         if available >= target:
-            assigned_unique = len(set(schedule.get(d.isoformat(), {}).values()))
+            assigned_unique = len({v for v in schedule.get(d.isoformat(), {}).values() if v is not None and str(v).strip() != ""})
             if assigned_unique < target:
                 return (
                     False,
