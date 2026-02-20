@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v77.py
+build_month_schedule_v78.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -59,10 +59,11 @@ Logic Changes (v34):
 - FIX (v74.1): Standardize validator counting via helper; make final BU label normalization display-only (no counter mutation) and run precedence-before-compaction; align BU candidate counting with enqueue logic.
 - FIX (v76): Auto-seed auto-enables weekday-target-repair when enforcing target staffing and expands default seed sweep; adds tight-day diagnostics showing when BU1 is required to reach target.
 - FIX (v77): Enforce 4-unique weekday staffing when available_count >= 4 (only relax when <4); prioritize constrained days first; add progress heartbeat dot every 3 seconds.
+- FIX (v78): BU1 fairness now continues from primary remainder pointer (W->BU1 carryover) and enforces combined (PN+AN+W+BU1) spread <= 1 when feasible.
 """
 
 # Compile sanity check (warnings enabled):
-#   python3 -Wall -m py_compile build_month_schedule_v77.py
+#   python3 -Wall -m py_compile build_month_schedule_v78.py
 
 from __future__ import annotations
 
@@ -241,6 +242,17 @@ def _rotate_left(lst: List[str], k: int) -> List[str]:
     if not lst: return lst
     k = k % len(lst)
     return lst[k:] + lst[:k]
+
+def distribute_with_cursor(order: List[str], total: int, n: int, cursor: int) -> Tuple[Dict[str, int], int]:
+    if n <= 0:
+        raise ValueError("n must be positive in distribute_with_cursor")
+    base = total // n
+    rem = total % n
+    targets = {p: base for p in order}
+    for i in range(rem):
+        targets[order[(cursor + i) % n]] += 1
+    cursor = (cursor + rem) % n
+    return targets, cursor
 
 def default_min_weekday_staff(roster_size: int) -> int:
     if roster_size <= 2:
@@ -710,43 +722,12 @@ def compute_primary_targets(days, roster, sales_order, hols):
     missing = [x for x in roster if x not in valid_order]
     full_priority = valid_order + missing
     
-    def distribute(role, total):
-        base = total // n
-        rem = total % n
-        for p in roster: targets[role][p] = base
-        
-        offset = 0
-        rem_pn = opp["PN"] % n
-        rem_an = opp["AN"] % n
-        
-        if role == "AN": offset = rem_pn
-        if role == "W": offset = (rem_pn + rem_an) % n
-        
-        rotated_order = _rotate_left(full_priority, offset)
-        for i in range(rem):
-            targets[role][rotated_order[i]] += 1
-
-    for r in opp: distribute(r, opp[r])
-    return targets
-
-
-def compute_primary_remainder_offset(days, roster, hols):
-    if not roster:
-        raise ValueError("Roster cannot be empty when computing primary remainder offsets")
-
-    opp = {"PN": 0, "AN": 0, "W": 0}
-    for d in days:
-        req = roles_required_for_day(d, hols)
-        for r in opp:
-            if r in req:
-                opp[r] += 1
-
-    n = len(roster)
-    rem_pn = opp["PN"] % n
-    rem_an = opp["AN"] % n
-    rem_w = opp["W"] % n
-    bu1_offset = (rem_pn + rem_an + rem_w) % n
-    return bu1_offset
+    cursor = 0
+    for role in ("PN", "AN", "W"):
+        role_targets, cursor = distribute_with_cursor(full_priority, opp[role], n, cursor)
+        for p in roster:
+            targets[role][p] = role_targets[p]
+    return targets, cursor, full_priority
 
 
 def build_schedule(config: BuildConfig,
@@ -761,8 +742,7 @@ def build_schedule(config: BuildConfig,
     roster_map = {norm_name(person): person for person in config.roster}
     
     hols = observed_holidays_for_year(year)
-    targets = compute_primary_targets(days, config.roster, config.sales_order, hols)
-    bu1_offset = compute_primary_remainder_offset(days, config.roster, hols)
+    targets, primary_remainder_cursor, primary_priority_order = compute_primary_targets(days, config.roster, config.sales_order, hols)
 
     schedule: Dict[str, Dict[str, str]] = {}
     day_difficulty: Dict[date, Tuple[int, int, int, int, date]] = {}
@@ -1203,22 +1183,32 @@ def build_schedule(config: BuildConfig,
     bu_targets = {role: {p: 0 for p in config.roster} for role in bu_roles_present}
     roster_set = set(config.roster)
     base_order = [x for x in config.sales_order if x in roster_set] + [x for x in config.roster if x not in config.sales_order]
-    rotated_for_bu1 = _rotate_left(base_order, bu1_offset)
+    bu1_priority_order = [p for p in primary_priority_order if p in roster_set]
+    bu_cursor = primary_remainder_cursor
     for role in bu_roles_present:
         opps = bu_opps[role]
         if opps <= 0:
             continue
+        if role == "BU1":
+            role_targets, bu_cursor = distribute_with_cursor(bu1_priority_order, opps, len(config.roster), bu_cursor)
+            for p in config.roster:
+                bu_targets[role][p] = role_targets[p]
+            continue
+
         base = opps // len(config.roster)
         rem = opps % len(config.roster)
         for p in config.roster:
             bu_targets[role][p] = base
-        target_order = rotated_for_bu1 if role == "BU1" else base_order
         for i in range(rem):
-            bu_targets[role][target_order[i]] += 1
+            bu_targets[role][base_order[i]] += 1
 
     bu_counts = {role: {p: 0 for p in config.roster} for role in bu_roles_present}
     bu_weekday_counts = {role: {p: {i: 0 for i in range(7)} for p in config.roster} for role in bu_roles_present}
+    primary_counts_total = {p: sum(role_counts[r][p] for r in ("PN", "AN", "W")) for p in config.roster}
     enforce_bu1_cap = True
+
+    def combined_total_for(person: str) -> int:
+        return primary_counts_total[person] + bu_counts.get("BU1", {}).get(person, 0)
 
     def add_bu_count(d: date, role: str, person: str):
         if role not in bu_counts:
@@ -1266,6 +1256,11 @@ def build_schedule(config: BuildConfig,
             s += (bu_targets[role][p] - bu_counts[role][p]) * deficit_weight
             s -= bu_weekday_counts[role][p][weekday_sun0(d)] * 10.0
         if role == 'BU1':
+            combined = {person: combined_total_for(person) for person in config.roster}
+            min_combined = min(combined.values())
+            s -= (combined[p] - min_combined) * 45.0
+            if combined[p] > min_combined + 1:
+                s -= 500.0 + (combined[p] - (min_combined + 1)) * 200.0
             # extra spread on Mondays (avoid the same BU1 on Mondays)
             if weekday_sun0(d) == 1:
                 s -= bu_weekday_counts['BU1'][p][1] * 25.0
@@ -1854,7 +1849,61 @@ def build_schedule(config: BuildConfig,
             for action in repair_log["log"][:10]:
                 print(f"[weekday-target-repair] {action}")
 
+    def balance_bu1_delta_pass() -> Tuple[int, int]:
+        bu1_swaps = 0
+
+        def combined_counts() -> Dict[str, int]:
+            return {p: primary_counts_total[p] + bu_counts.get("BU1", {}).get(p, 0) for p in config.roster}
+
+        while True:
+            combined = combined_counts()
+            min_v = min(combined.values())
+            max_v = max(combined.values())
+            if max_v - min_v <= 1:
+                return bu1_swaps, max_v - min_v
+
+            hi_people = [p for p in config.roster if combined[p] == max_v]
+            lo_people = [p for p in config.roster if combined[p] == min_v]
+            moved = False
+
+            for hi in hi_people:
+                for lo in lo_people:
+                    for d in days:
+                        if schedule[d.isoformat()].get("BU1") != hi:
+                            continue
+                        if lo in schedule[d.isoformat()].values():
+                            continue
+
+                        d_iso = d.isoformat()
+                        schedule[d_iso]["BU1"] = lo
+                        remove_bu_count(d, "BU1", hi)
+                        add_bu_count(d, "BU1", lo)
+                        total_hours[hi] -= 8
+                        total_hours[lo] += 8
+
+                        if not can_bu(d, "BU1", lo):
+                            schedule[d_iso]["BU1"] = hi
+                            remove_bu_count(d, "BU1", lo)
+                            add_bu_count(d, "BU1", hi)
+                            total_hours[hi] += 8
+                            total_hours[lo] -= 8
+                            continue
+
+                        bu1_swaps += 1
+                        moved = True
+                        break
+                    if moved:
+                        break
+                if moved:
+                    break
+
+            if not moved:
+                final_combined = combined_counts()
+                return bu1_swaps, max(final_combined.values()) - min(final_combined.values())
+
     # ALWAYS enforce BU1 precedence after all BU work (regardless of repair flag).
+    normalize_bu1_precedence_all_days()
+    bu1_balance_swaps, final_combined_spread = balance_bu1_delta_pass()
     normalize_bu1_precedence_all_days()
 
     for d in days:
@@ -2313,7 +2362,7 @@ def export_to_excel(schedule, year, month, out_path, roster, hols, prev_sched,
     ws2 = wb.create_sheet("Summary")
     ws2["A1"] = "Summary"
     ws2["A1"].font = Font(bold=True, size=14)
-    ws2.append(["Name"] + ROLE_PRIMARY + ROLE_BUS + ["Total", "Hours"])
+    ws2.append(["Name"] + ROLE_PRIMARY + ROLE_BUS + ["Combined (PN+AN+W+BU1)", "Total", "Hours"])
 
     for person in roster:
         counts = {r: 0 for r in ROLE_PRIMARY + ROLE_BUS}
@@ -2323,8 +2372,9 @@ def export_to_excel(schedule, year, month, out_path, roster, hols, prev_sched,
                 if nm == person:
                     counts[r] += 1
                     tot_hrs += hours_for_role(_date.fromisoformat(d_iso), r, hols)
+        combined_total = counts["PN"] + counts["AN"] + counts["W"] + counts["BU1"]
         tot_ass = sum(counts[r] for r in ROLE_PRIMARY + ROLE_BUS)
-        ws2.append([person] + [counts[r] for r in ROLE_PRIMARY + ROLE_BUS] + [tot_ass, tot_hrs])
+        ws2.append([person] + [counts[r] for r in ROLE_PRIMARY + ROLE_BUS] + [combined_total, tot_ass, tot_hrs])
 
     if payperiods:
         ws3 = wb.create_sheet("Pay Period Hours")
@@ -2340,7 +2390,7 @@ def export_to_excel(schedule, year, month, out_path, roster, hols, prev_sched,
                 row.append(h)
             ws3.append(row)
 
-    targets = compute_primary_targets(month_days(year, month), roster, sales_order, hols)
+    targets, _, _ = compute_primary_targets(month_days(year, month), roster, sales_order, hols)
     write_violations_tab(wb, schedule, year, month, roster, targets, cons,
                          prev_sched, payperiods, hols, week_starts)
     wb.save(out_path)
