@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v70.py
+build_month_schedule_v71.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -51,6 +51,7 @@ Logic Changes (v34):
 - FIX (v68): Relax cross-month Sat AN -> Sun PN pairing when prior-month AN assignee is not in the active roster (supports roster changes).
 - FIX (v69): BU1 targets now use primary remainder rotation (PN->AN->W->BU1) to keep BU1 distribution aligned with primary fairness.
 - FIX (v70): Auto-seed now enforces target weekday staffing when available by default (robust 4-when-available search).
+- FIX (v71): Restore dynamic default target_weekday_staff (scales with roster size) while keeping auto-seed enforcement default.
 """
 
 from __future__ import annotations
@@ -2301,10 +2302,10 @@ def main():
         if roster is None:
             roster = DEFAULT_ROSTER[:]
     if not target_weekday_staff_overridden:
-        if len(roster) >= 4:
-            args.target_weekday_staff = 4
-        else:
+        if len(roster) < 4:
             args.target_weekday_staff = len(roster)
+        else:
+            args.target_weekday_staff = min(5, max(4, len(roster) - 1))
     if not min_weekday_staff_overridden:
         args.min_weekday_staff = default_min_weekday_staff(len(roster))
 
