@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v75.py
+build_month_schedule_v76.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -57,6 +57,7 @@ Logic Changes (v34):
 - FIX (v73): Auto-seed perfect-check ignores blank/None values; BU queue is solved hardest-first; auto-seed runs quietly unless verbose.
 - FIX (v74): Consistent unique-assignee counting; BU sequencing enforced (no BU2 without BU1) with hardest-first ordering; auto-seed catches all exceptions; BU compaction; misc guardrails.
 - FIX (v74.1): Standardize validator counting via helper; make final BU label normalization display-only (no counter mutation) and run precedence-before-compaction; align BU candidate counting with enqueue logic.
+- FIX (v76): Auto-seed auto-enables weekday-target-repair when enforcing target staffing and expands default seed sweep; adds tight-day diagnostics showing when BU1 is required to reach target.
 """
 
 from __future__ import annotations
@@ -2027,6 +2028,35 @@ def validate_target_when_available(
     return True, "OK"
 
 
+def tight_day_diagnostics(
+    schedule: Dict[str, Dict[str, str]],
+    year: int,
+    month: int,
+    hols: Set[date],
+    roster: List[str],
+    cons: Constraints,
+    target: int,
+) -> List[str]:
+    lines: List[str] = []
+    for d in month_days(year, month):
+        if d in hols or not is_weekday(d):
+            continue
+        available_count = len(roster) - len(cons.hard_off.get(d, set()))
+        if available_count != target:
+            continue
+        day_key = d.isoformat()
+        roles = schedule.get(day_key, {})
+        assigned_unique = unique_assignee_count(roles)
+        if assigned_unique != target - 1:
+            continue
+        primaries = {k: v for k, v in roles.items() if k in ("PN", "AN", "W")}
+        lines.append(
+            f"TIGHT DAY {day_key}: available==target=={target}, assigned_unique={assigned_unique}; "
+            f"primaries={primaries}, missing 1 unique — typically requires BU1 to be filled; roles={roles}"
+        )
+    return lines
+
+
 # ----------------------------
 # Violations & Export
 # ----------------------------
@@ -2311,6 +2341,8 @@ def main():
     ap.add_argument("--optimize-weekday-staff", action="store_true")
     ap.add_argument("--weekday-target-repair", action="store_true",
                     help="After BU fill, attempt BU-only micro-swaps within the same week to raise eligible weekdays to target staffing.")
+    ap.add_argument("--no-weekday-target-repair", action="store_true",
+                    help="Disable automatic weekday target repair even during auto-seed enforcement.")
     ap.add_argument("--primary-swap-repair", action="store_true",
                     help="Allow like-for-like primary swaps (PN/AN/W) across dates to free weekly capacity so a missing BU slot can be filled on an eligible weekday.")
     ap.add_argument("--weekday-target-repair-verbose", action="store_true")
@@ -2354,6 +2386,10 @@ def main():
             enforce_target = True
     else:
         enforce_target = args.enforce_target_when_available
+
+    weekday_repair_explicit = any(a == "--weekday-target-repair" for a in sys.argv[1:])
+    if args.auto_seed and enforce_target and (not weekday_repair_explicit) and (not args.no_weekday_target_repair):
+        args.weekday_target_repair = True
 
     wb_for_sheet = openpyxl.load_workbook(args.timeoff_xlsx, data_only=True)
     try:
@@ -2418,6 +2454,9 @@ def main():
             else:
                 seed_end = min(seed_end, seed_start + args.max_attempts - 1)
 
+        if args.auto_seed and enforce_target and (not seed_end_overridden) and (not max_attempts_overridden):
+            seed_end = max(seed_end, seed_start + 399)
+
         # Guard: prevent empty seed range (e.g., --seed-start > --seed-end)
         if seed_start > seed_end:
             raise ValueError("Resolved seed range is empty: ensure --seed-start <= --seed-end")
@@ -2445,6 +2484,7 @@ def main():
         winning_payperiod_over80 = None
         best_score = None
         last_failure_reason = "No seeds attempted"
+        last_tight_day_lines: List[str] = []
 
         total_required_target_days = 0
         for d in month_days(year, month):
@@ -2494,8 +2534,22 @@ def main():
             )
             if not ok:
                 last_failure_reason = f"Seed {seed} failed validator: {reason}"
+                tight_lines = tight_day_diagnostics(
+                    candidate,
+                    year,
+                    month,
+                    hols,
+                    roster,
+                    cons,
+                    min(args.min_weekday_staff, args.target_weekday_staff),
+                )
+                last_tight_day_lines = tight_lines
+                if tight_lines:
+                    last_failure_reason += f" | {tight_lines[0]}"
                 if args.auto_seed_verbose:
                     print(last_failure_reason)
+                    for line in tight_lines[:5]:
+                        print(f"[tight-day] {line}")
                 continue
 
             if enforce_target:
@@ -2510,8 +2564,22 @@ def main():
                 )
                 if not ok_target:
                     last_failure_reason = f"Seed {seed} failed validator: {reason_target}"
+                    tight_lines = tight_day_diagnostics(
+                        candidate,
+                        year,
+                        month,
+                        hols,
+                        roster,
+                        cons,
+                        args.target_weekday_staff,
+                    )
+                    last_tight_day_lines = tight_lines
+                    if tight_lines:
+                        last_failure_reason += f" | {tight_lines[0]}"
                     if args.auto_seed_verbose:
                         print(last_failure_reason)
+                        for line in tight_lines[:5]:
+                            print(f"[tight-day] {line}")
                     continue
 
             metrics = weekday_staff_metrics(
@@ -2569,11 +2637,22 @@ def main():
                 break
 
         if sched is None:
+            final_tight_lines = last_tight_day_lines[:]
+            hint = (
+                "Hint: enforcement requires reaching target unique staffing on eligible weekdays; "
+                "a 4th unique person typically comes from BU1. Try --weekday-target-repair and/or "
+                "increase --seed-end. "
+                f"Resolved: weekday_target_repair={args.weekday_target_repair}, "
+                f"seed_range=[{seed_start}, {seed_end}], enforce_target={enforce_target}"
+            )
+            tight_suffix = ""
+            if final_tight_lines:
+                tight_suffix = " Tight days: " + " | ".join(final_tight_lines[:5])
             raise RuntimeError(
                 f"Auto-seed failed for range [{seed_start}, {seed_end}] with "
                 f"target_weekday_staff={args.target_weekday_staff}, "
                 f"enforce_target_when_available={enforce_target}. "
-                f"Last failure: {last_failure_reason}"
+                f"Last failure: {last_failure_reason}. {hint}{tight_suffix}"
             )
 
         print(f"✅ Auto-seed success: seed={winning_seed}")
