@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v73.py
+build_month_schedule_v74.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -54,6 +54,7 @@ Logic Changes (v34):
 - FIX (v71): Restore dynamic default target_weekday_staff (scales with roster size) while keeping auto-seed enforcement default.
 - FIX (v72): Fix Sales Ranking quarter regex; ignore blank/None values in staffing validators; normalize prev-schedule names for Sunday rotation and cross-month comparisons.
 - FIX (v73): Auto-seed perfect-check ignores blank/None values; BU queue is solved hardest-first; auto-seed runs quietly unless verbose.
+- FIX (v74): Consistent unique-assignee counting; BU sequencing enforced (no BU2 without BU1) with hardest-first ordering; auto-seed catches all exceptions; BU compaction; misc guardrails.
 """
 
 from __future__ import annotations
@@ -241,6 +242,12 @@ def default_min_weekday_staff(roster_size: int) -> int:
     if roster_size == 4:
         return 3
     return 4
+
+def unique_assignees(values) -> Set[str]:
+    return {v for v in values if v is not None and str(v).strip() != ""}
+
+def unique_assignee_count(role_map: Dict[str, str]) -> int:
+    return len(unique_assignees(role_map.values()))
 
 # Global logic checks
 _week_push_cache: Dict[date, bool] = {}
@@ -1195,6 +1202,7 @@ def build_schedule(config: BuildConfig,
         bu_weekday_counts[role][person][wd] = max(0, bu_weekday_counts[role][person][wd] - 1)
 
     # --- BU FILL ---
+    BU_ROLE_RANK = {"BU1": 1, "BU2": 2, "BU3": 3, "BU4": 4}
     bu_queue = []
     for d in days:
         ideal = ideal_bu_roles_for_day(d, roster_size)
@@ -1207,14 +1215,21 @@ def build_schedule(config: BuildConfig,
 
         for rname in ideal:
             valid_cands = [p for p in pool if can_bu(d, rname, p)]
-            if not valid_cands: continue
-
+            if rname == "BU1" and not valid_cands:
+                break
+            if rname != "BU1" and not valid_cands:
+                break
             bu_queue.append((d, rname))
 
-    def bu_candidate_count(d: date, role: str) -> int:
-        return sum(1 for p in config.roster if can_bu(d, role, p))
-
-    bu_queue.sort(key=lambda item: (bu_candidate_count(item[0], item[1]), item[0], item[1]))
+    cand_count = {
+        (d, role): sum(1 for p in config.roster if can_bu(d, role, p))
+        for (d, role) in bu_queue
+    }
+    bu_queue.sort(key=lambda item: (
+        cand_count[item],
+        item[0],
+        BU_ROLE_RANK.get(item[1], 99),
+    ))
 
     def bu_score(d, role, p):
         s = rng.random()
@@ -1444,6 +1459,15 @@ def build_schedule(config: BuildConfig,
     else:
         print("No BU repair swaps performed.")
 
+    def compact_bu_for_day(day_iso: str) -> None:
+        rm = schedule.get(day_iso, {})
+        vals = [rm.get("BU1", ""), rm.get("BU2", ""), rm.get("BU3", ""), rm.get("BU4", "")]
+        vals = [v for v in vals if v is not None and str(v).strip() != ""]
+        for k in ("BU1", "BU2", "BU3", "BU4"):
+            rm.pop(k, None)
+        for i, v in enumerate(vals):
+            rm[f"BU{i+1}"] = v
+
     def normalize_bu1_precedence_all_days():
         for d in month_days(year, month):
             expected_roles = ideal_bu_roles_for_day(d, roster_size)
@@ -1631,11 +1655,11 @@ def build_schedule(config: BuildConfig,
                 continue
 
             d_iso = d.isoformat()
-            if len(set(schedule[d_iso].values())) >= target_weekday_staff:
+            if unique_assignee_count(schedule[d_iso]) >= target_weekday_staff:
                 continue
             day_improved = False
             day_stop_reason: Optional[str] = None
-            while len(set(schedule[d_iso].values())) < target_weekday_staff:
+            while unique_assignee_count(schedule[d_iso]) < target_weekday_staff:
                 if attempts_for_day >= max_attempts_per_day:
                     day_stop_reason = f"day {d_iso}: stopped; reached max attempts ({max_attempts_per_day})"
                     break
@@ -1646,7 +1670,7 @@ def build_schedule(config: BuildConfig,
                     break
                 attempts_for_day += 1
 
-                pre_unique = len(set(schedule[d_iso].values()))
+                pre_unique = unique_assignee_count(schedule[d_iso])
                 assigned_today = set(schedule[d_iso].values())
                 available_today = [
                     p for p in roster
@@ -1667,7 +1691,7 @@ def build_schedule(config: BuildConfig,
                     total_hours[pick] += 8
                     add_bu_count(d, desired_role, pick)
                     normalize_bu1_skip(d)
-                    post_unique = len(set(schedule[d_iso].values()))
+                    post_unique = unique_assignee_count(schedule[d_iso])
                     if post_unique > pre_unique:
                         day_improved = True
                     moves_performed += 1
@@ -1729,7 +1753,7 @@ def build_schedule(config: BuildConfig,
                                 total_hours[x] += 8
                                 add_bu_count(d, desired_role, x)
                                 normalize_bu1_skip(d)
-                                post_unique = len(set(schedule[d_iso].values()))
+                                post_unique = unique_assignee_count(schedule[d_iso])
                                 if post_unique > pre_unique:
                                     day_improved = True
                                 moves_performed += 2
@@ -1758,10 +1782,10 @@ def build_schedule(config: BuildConfig,
                     continue
 
                 if config.enable_primary_swap_repair:
-                    pre_swap_unique = len(set(schedule[d_iso].values()))
+                    pre_swap_unique = unique_assignee_count(schedule[d_iso])
                     swapped = attempt_primary_swap_to_free_capacity(d, desired_role)
                     if swapped:
-                        post_swap_unique = len(set(schedule[d_iso].values()))
+                        post_swap_unique = unique_assignee_count(schedule[d_iso])
                         if post_swap_unique > pre_swap_unique:
                             day_improved = True
                         continue
@@ -1806,6 +1830,11 @@ def build_schedule(config: BuildConfig,
             for action in repair_log["log"][:10]:
                 print(f"[weekday-target-repair] {action}")
 
+    for d in days:
+        if d in hols or is_sunday(d):
+            continue
+        compact_bu_for_day(d.isoformat())
+
     # ALWAYS enforce BU1 precedence after all BU work (regardless of repair flag).
     normalize_bu1_precedence_all_days()
 
@@ -1838,7 +1867,7 @@ def validate_min_weekday_staff(
 
         day_key = day.isoformat()
         day_roles = schedule.get(day_key, {})
-        assigned_people = {v for v in day_roles.values() if v is not None and str(v).strip() != ""}
+        assigned_people = unique_assignees(day_roles.values())
         available_count = len(roster) - len(cons.hard_off.get(day, set()))
         effective_min = min(min_staff, available_count)
         if len(assigned_people) < effective_min:
@@ -1872,7 +1901,7 @@ def weekday_staff_metrics(
             continue
 
         eligible_weekdays_checked += 1
-        assigned_count = len({v for v in schedule.get(d.isoformat(), {}).values() if v is not None and str(v).strip() != ""})
+        assigned_count = unique_assignee_count(schedule.get(d.isoformat(), {}))
         if (
             eligible_min_assigned_on_weekday is None
             or assigned_count < eligible_min_assigned_on_weekday
@@ -2454,7 +2483,7 @@ def main():
                     buf = io.StringIO()
                     with contextlib.redirect_stdout(buf):
                         candidate = build_schedule(cfg, prev, cons, pps)
-            except RuntimeError as e:
+            except Exception as e:
                 last_failure_reason = f"Seed {seed} failed to solve: {e}"
                 if args.auto_seed_verbose:
                     print(last_failure_reason)
@@ -2535,10 +2564,7 @@ def main():
                 available_count = len(roster) - len(cons.hard_off.get(d, set()))
                 if available_count < args.target_weekday_staff:
                     continue
-                assigned_count = len({
-                    v for v in candidate.get(d.isoformat(), {}).values()
-                    if v is not None and str(v).strip() != ""
-                })
+                assigned_count = unique_assignee_count(candidate.get(d.isoformat(), {}))
                 if assigned_count >= args.target_weekday_staff:
                     met_required_target_days += 1
 
