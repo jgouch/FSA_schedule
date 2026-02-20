@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v74.py
+build_month_schedule_v75.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -23,6 +23,7 @@ LOCKED CALENDAR GEOMETRY:
     BU4 name (push-week Saturday only): (mid, R+7)
 
 Logic Changes (v34):
+- FIX (v75): Fix Sales Ranking selection indentation so ranking period is chosen after scanning all rows (no premature return).
 - CLEANUP: MAX_WEEKS constant physically deleted.
 - OPTIMIZATION: Added caching for holiday lookup (speeds up hours calc).
 - UNIFICATION: 5-day cap logic now uses global 'calculate_daily_hours' helper.
