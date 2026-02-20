@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v72.py
+build_month_schedule_v73.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -53,12 +53,15 @@ Logic Changes (v34):
 - FIX (v70): Auto-seed now enforces target weekday staffing when available by default (robust 4-when-available search).
 - FIX (v71): Restore dynamic default target_weekday_staff (scales with roster size) while keeping auto-seed enforcement default.
 - FIX (v72): Fix Sales Ranking quarter regex; ignore blank/None values in staffing validators; normalize prev-schedule names for Sunday rotation and cross-month comparisons.
+- FIX (v73): Auto-seed perfect-check ignores blank/None values; BU queue is solved hardest-first; auto-seed runs quietly unless verbose.
 """
 
 from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
+import io
 import json
 import random
 import re
@@ -1207,6 +1210,11 @@ def build_schedule(config: BuildConfig,
             if not valid_cands: continue
 
             bu_queue.append((d, rname))
+
+    def bu_candidate_count(d: date, role: str) -> int:
+        return sum(1 for p in config.roster if can_bu(d, role, p))
+
+    bu_queue.sort(key=lambda item: (bu_candidate_count(item[0], item[1]), item[0], item[1]))
 
     def bu_score(d, role, p):
         s = rng.random()
@@ -2440,7 +2448,12 @@ def main():
             if args.auto_seed_verbose:
                 print(f"Trying seed {seed}")
             try:
-                candidate = build_schedule(cfg, prev, cons, pps)
+                if args.auto_seed_verbose:
+                    candidate = build_schedule(cfg, prev, cons, pps)
+                else:
+                    buf = io.StringIO()
+                    with contextlib.redirect_stdout(buf):
+                        candidate = build_schedule(cfg, prev, cons, pps)
             except RuntimeError as e:
                 last_failure_reason = f"Seed {seed} failed to solve: {e}"
                 if args.auto_seed_verbose:
@@ -2522,7 +2535,10 @@ def main():
                 available_count = len(roster) - len(cons.hard_off.get(d, set()))
                 if available_count < args.target_weekday_staff:
                     continue
-                assigned_count = len(set(candidate.get(d.isoformat(), {}).values()))
+                assigned_count = len({
+                    v for v in candidate.get(d.isoformat(), {}).values()
+                    if v is not None and str(v).strip() != ""
+                })
                 if assigned_count >= args.target_weekday_staff:
                     met_required_target_days += 1
 
