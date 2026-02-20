@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v63.py
+build_month_schedule_v64.py
 
 End-to-end month builder:
 - Reads TimeOff.xlsx (monthly request sheet + Sales Ranking tab)
@@ -44,7 +44,7 @@ Logic Changes (v34):
 - FIX (v60): primary swap micro-pass now tries all candidate people before failing (fix premature return inside loop).
 - FIX (v61): primary swap micro-pass now correctly tries all candidate people before failing (dedent final return False outside the candidate loop).
 - FIX (v62): primary swap micro-pass final failure return moved outside candidate loop (correct indentation).
-- FIX (v63): primary swap micro-pass final failure block truly moved outside the candidate loop (corrected indentation).
+- FIX (v64): primary swap micro-pass final failure block truly moved outside the candidate loop (corrected indentation).
 """
 
 from __future__ import annotations
@@ -378,6 +378,86 @@ def load_roster_from_json(path: str) -> List[str]:
     if not roster:
         raise ValueError("Roster JSON must contain at least one non-blank name")
     return roster
+
+def load_roster_from_timeoff_xlsx(
+    xlsx_path: str,
+    sheet_name: str,
+    year: int,
+    month: int,
+) -> Optional[List[str]]:
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return None
+
+        ws = wb[sheet_name]
+        headers = {}
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(1, c).value
+            if v:
+                headers[_normalize_header_key(v)] = c
+
+        c_name = headers.get("name")
+        if not c_name:
+            raise ValueError(f"Roster sheet '{sheet_name}' missing required 'Name' column")
+
+        c_active = headers.get("active")
+        if c_active is None:
+            c_active = headers.get("status")
+        c_start = headers.get("start")
+        c_end = headers.get("end")
+
+        month_start = date(year, month, 1)
+        month_end = date(year, month, calendar.monthrange(year, month)[1])
+
+        def parse_active(v) -> bool:
+            if v is None:
+                return True
+            s = str(v).strip()
+            if s == "":
+                return True
+            u = s.upper()
+            if u in {"Y", "YES", "TRUE", "1"}:
+                return True
+            if u in {"N", "NO", "FALSE", "0"}:
+                return False
+            return True
+
+        roster: List[str] = []
+        seen: Set[str] = set()
+        for r in range(2, ws.max_row + 1):
+            nv = ws.cell(r, c_name).value
+            if nv is None or str(nv).strip() == "":
+                continue
+            name = norm_name(nv)
+            if not name:
+                continue
+
+            is_active = parse_active(ws.cell(r, c_active).value) if c_active else True
+            if not is_active:
+                continue
+
+            sv = ws.cell(r, c_start).value if c_start else None
+            ev = ws.cell(r, c_end).value if c_end else None
+            sd = parse_excel_date(sv) if sv not in (None, "") else None
+            ed = parse_excel_date(ev) if ev not in (None, "") else None
+
+            if sd and sd > month_end:
+                continue
+            if ed and ed < month_start:
+                continue
+
+            if name not in seen:
+                seen.add(name)
+                roster.append(name)
+
+        if not roster:
+            raise ValueError(
+                f"Roster sheet '{sheet_name}' exists but contains zero active roster names for {year}-{month:02d}"
+            )
+        return roster
+    finally:
+        wb.close()
 
 def load_payperiods_from_json(path: str) -> List[Tuple[date, date]]:
     data = json.loads(Path(path).read_text("utf-8"))
@@ -2061,6 +2141,7 @@ def main():
     ap.add_argument("--timeoff-sheet", required=True)
     ap.add_argument("--prev-schedule", required=True)
     ap.add_argument("--sales-sheet", default="Sales Ranking")
+    ap.add_argument("--roster-sheet", default="Roster")
     ap.add_argument("--roster-json")
     ap.add_argument("--payperiods-json")
     ap.add_argument("--payperiod-anchor-start", default="2026-01-25")
@@ -2085,7 +2166,17 @@ def main():
     args = ap.parse_args()
 
     year, month = parse_month_arg(args.month)
-    roster = load_roster_from_json(args.roster_json) if args.roster_json else DEFAULT_ROSTER[:]
+    if args.roster_json:
+        roster = load_roster_from_json(args.roster_json)
+    else:
+        roster = load_roster_from_timeoff_xlsx(
+            args.timeoff_xlsx,
+            args.roster_sheet,
+            year,
+            month,
+        )
+        if roster is None:
+            roster = DEFAULT_ROSTER[:]
     timeoff = load_timeoff_from_xlsx(args.timeoff_xlsx, args.timeoff_sheet)
     cons = compile_constraints(timeoff)
     sales = load_sales_ranking_from_timeoff_xlsx(args.timeoff_xlsx, args.sales_sheet, year, month, roster)
