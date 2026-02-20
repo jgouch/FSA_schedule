@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v67.py
+build_month_schedule_v68.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -48,6 +48,7 @@ Logic Changes (v34):
 - FIX (v65): Dynamic staffing scaling for changing roster size + support FSA Schedule Info.xlsx workbook conventions (Roster/Sales Ranking/month request sheets).
 - FIX (v66): Dynamic BU role scaling across changing roster sizes (no BU4 for 5-person teams) + repair pass counter correctness for BU fairness.
 - FIX (v67): Min weekday staffing is now dynamic (scales with roster size) and enforced only up to daily availability.
+- FIX (v68): Relax cross-month Sat AN -> Sun PN pairing when prior-month AN assignee is not in the active roster (supports roster changes).
 """
 
 from __future__ import annotations
@@ -715,6 +716,7 @@ def build_schedule(config: BuildConfig,
     rng = random.Random(config.rng_seed)
     year, month = config.year, config.month
     days = month_days(year, month)
+    roster_set = {norm_name(person) for person in config.roster}
     
     hols = observed_holidays_for_year(year)
     targets = compute_primary_targets(days, config.roster, config.sales_order, hols)
@@ -858,8 +860,13 @@ def build_schedule(config: BuildConfig,
                     if sat_an and sat_an != name:
                         return False
                 else:
-                    if prev_sched.get(sat.isoformat(), {}).get('AN') != name:
-                        return False
+                    prev_an = prev_sched.get(sat.isoformat(), {}).get('AN')
+                    if prev_an is None or str(prev_an).strip() == '':
+                        pass
+                    else:
+                        prev_an_norm = norm_name(prev_an)
+                        if prev_an_norm in roster_set and prev_an_norm != name:
+                            return False
 
 
         if role == 'AN' and is_saturday(d):
@@ -1019,8 +1026,12 @@ def build_schedule(config: BuildConfig,
                     else:
                         prev_roles = prev_sched.get(sat.isoformat(), {})
                         prev_an = prev_roles.get('AN')
-                        if (prev_an is None) or (str(prev_an).strip() == '') or (prev_an != who):
-                            continue
+                        if prev_an is None or str(prev_an).strip() == '':
+                            pass
+                        else:
+                            prev_an_norm = norm_name(prev_an)
+                            if prev_an_norm in roster_set and prev_an_norm != who:
+                                continue
 
                     # Assign Sunday PN
                     schedule[sd.isoformat()]['PN'] = who
