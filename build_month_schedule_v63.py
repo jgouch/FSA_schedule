@@ -760,12 +760,13 @@ def build_schedule(config: BuildConfig,
                     days_worked += 1
             if days_worked >= 5: return False
 
-        if not is_push_week:
+        if not (is_push_week or is_holiday_week):
              curr_pp_h = pp_hours(name, d)
              if curr_pp_h + hours_for_role(d, role, hols) > 80: return False
 
-        # PN fairness stays enforced even in RELAXED mode (prevents PN delta > 1)
-        if role == 'PN' and role_counts[role][name] >= targets[role][name]: return False
+        if role == 'PN' and not strict_mode:
+            pn_counts = [role_counts['PN'][p] + (1 if p == name else 0) for p in config.roster]
+            if (max(pn_counts) - min(pn_counts)) > 1: return False
         if strict_mode:
             if role_counts[role][name] >= targets[role][name]: return False
             if role == "PN" and weekday_sun0(d) == 1 and monday_pn_used[name] >= 1: return False
@@ -809,7 +810,7 @@ def build_schedule(config: BuildConfig,
                      days_w += 1
              if days_w >= 5: return False
         
-        if not is_push:
+        if not (is_push or is_hol):
              if pp_hours(p, d) + 8 > 80: return False
 
         return True
@@ -1002,18 +1003,13 @@ def build_schedule(config: BuildConfig,
 
         assigned = set(schedule[d.isoformat()].values())
         hard = cons.hard_off.get(d, set())
-        pool = sorted([p for p in config.roster if p not in assigned and p not in hard])
-        
-        temp_pool = pool[:]
+        pool = [p for p in config.roster if p not in assigned and p not in hard]
+
         for rname in ideal:
-            if not temp_pool: break
-            
-            valid_cands = [p for p in temp_pool if can_bu(d, rname, p)]
+            valid_cands = [p for p in pool if can_bu(d, rname, p)]
             if not valid_cands: continue
 
             bu_queue.append((d, rname))
-            person_to_reserve = valid_cands[0]
-            temp_pool.remove(person_to_reserve)
 
     def bu_score(d, role, p):
         s = rng.random()
@@ -1066,7 +1062,8 @@ def build_schedule(config: BuildConfig,
 
         return False
 
-    if not solve_bu(0):
+    bu_fill_success = solve_bu(0)
+    if not bu_fill_success:
         if enforce_bu1_cap:
             enforce_bu1_cap = False
             # Clear existing BU assignments and retry without the BU1 cap (still respects all hour/dayoff rules).
@@ -1078,27 +1075,31 @@ def build_schedule(config: BuildConfig,
             for p2 in bu1_weekday_counts:
                 for wd in bu1_weekday_counts[p2]:
                     bu1_weekday_counts[p2][wd] = 0
-            if not solve_bu(0):
+            bu_fill_success = solve_bu(0)
+            if bu_fill_success:
+                print("BU fill successful after relaxing BU1 cap.")
+            else:
                 print("Warning: Could not fill all desired BU slots.")
         else:
             print("Warning: Could not fill all desired BU slots.")
-        # --- Greedy fallback BU fill (best effort) ---
-        # If full backtracking can't fill every BU slot, keep what we can.
-        for d, role in bu_queue:
-            d_iso = d.isoformat()
-            if role in schedule[d_iso]:
-                continue
-            cands = [person for person in config.roster if can_bu(d, role, person)]
-            if not cands:
-                continue
-            cands.sort(key=lambda person: bu_score(d, role, person), reverse=True)
-            pick = cands[0]
-            schedule[d_iso][role] = pick
-            total_hours[pick] += 8
-            if role == 'BU1':
-                bu1_counts[pick] += 1
-                bu1_weekday_counts[pick][weekday_sun0(d)] += 1
-        # --- end greedy fallback ---
+        if not bu_fill_success:
+            # --- Greedy fallback BU fill (best effort) ---
+            # If full backtracking can't fill every BU slot, keep what we can.
+            for d, role in bu_queue:
+                d_iso = d.isoformat()
+                if role in schedule[d_iso]:
+                    continue
+                cands = [person for person in config.roster if can_bu(d, role, person)]
+                if not cands:
+                    continue
+                cands.sort(key=lambda person: bu_score(d, role, person), reverse=True)
+                pick = cands[0]
+                schedule[d_iso][role] = pick
+                total_hours[pick] += 8
+                if role == 'BU1':
+                    bu1_counts[pick] += 1
+                    bu1_weekday_counts[pick][weekday_sun0(d)] += 1
+            # --- end greedy fallback ---
 
     # --- BU REPAIR PASS (BU2/BU3 only) ---
     bu_repair_swaps = []
@@ -1750,7 +1751,7 @@ def payperiod_over80_events(
         pp_relaxed = False
         cur_wk = week_start_sun(s)
         while cur_wk <= e:
-            if week_contains_push(cur_wk):
+            if week_contains_push(cur_wk) or week_contains_holiday(cur_wk):
                 pp_relaxed = True
                 break
             cur_wk += timedelta(days=7)
@@ -1817,11 +1818,11 @@ def audit_hours_caps(ws_vio, roster, week_starts, payperiods, schedule, prev_sch
     # 2. PP Check
     if payperiods:
         for s, e in payperiods:
-            # Relax if PP contains ANY push week (start)
+            # Relax if PP contains ANY push or holiday week.
             pp_relaxed = False
             cur_wk = week_start_sun(s)
             while cur_wk <= e:
-                if week_contains_push(cur_wk):
+                if week_contains_push(cur_wk) or week_contains_holiday(cur_wk):
                     pp_relaxed = True
                     break
                 cur_wk += timedelta(days=7)
@@ -1888,7 +1889,10 @@ def write_violations_tab(wb, schedule, year, month, roster, targets, cons, prev_
                 prev_roles = prev_sched.get(prev_d.isoformat(), {})
             
             if prev_roles.get(r) == p:
-                ws_vio.append(["Back-to-Back (Same Role)", p, f"Worked {r} on {prev_d} and {d}"])
+                if r.startswith("BU"):
+                    ws_vio.append(["BU Rotation Warning", p, f"BU role repeated on consecutive days: {r} on {prev_d} and {d}"])
+                else:
+                    ws_vio.append(["Back-to-Back (Same Role)", p, f"Worked {r} on {prev_d} and {d}"])
 
         # A. Duplicate Assignment (Aggregated)
         for p, roles in roles_by_person.items():
@@ -2096,6 +2100,9 @@ def main():
         pps = [p for p in raw if p[0] <= me and p[1] >= ms]
     hols = observed_holidays_for_year(year)
     if not args.auto_seed:
+        _week_push_cache.clear()
+        _week_hol_cache.clear()
+        _push_days_cache.clear()
         cfg = BuildConfig(
             year,
             month,
@@ -2159,6 +2166,9 @@ def main():
 
         for seed in range(seed_start, seed_end + 1):
             perfect_found = False
+            _week_push_cache.clear()
+            _week_hol_cache.clear()
+            _push_days_cache.clear()
             cfg = BuildConfig(
                 year,
                 month,
