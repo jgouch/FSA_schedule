@@ -265,22 +265,24 @@ def week_contains_holiday(ws: date) -> bool:
 # Global hours calculator (Single Source of Truth)
 def calculate_daily_hours(dd: date, name: str, schedule: Dict, prev_sched: Dict, year: int, month: int) -> int:
     """Calculate hours for a person on a specific date, handling month boundaries."""
-    
-    # Dynamic holiday lookup based on the specific date's year
-    hols = observed_holidays_for_year(dd.year)
-    
+
     if dd.year == year and dd.month == month:
         roles = schedule.get(dd.isoformat(), {})
+        if name not in roles.values():
+            return 0
+        hols = observed_holidays_for_year(dd.year)
         dh = 0
         for r, n in roles.items():
             if n == name: dh = max(dh, hours_for_role(dd, r, hols))
         return dh
     elif dd < date(year, month, 1):
         roles = prev_sched.get(dd.isoformat(), {})
+        if name not in roles.values():
+            return 0
+        hols = observed_holidays_for_year(dd.year)
         dh = 0
         for r, n in roles.items():
-            if n == name: 
-                dh = max(dh, hours_for_role(dd, r, hols))
+            if n == name: dh = max(dh, hours_for_role(dd, r, hols))
         return dh
     return 0
 
@@ -2367,9 +2369,6 @@ def main():
 
         for seed in range(seed_start, seed_end + 1):
             perfect_found = False
-            _week_push_cache.clear()
-            _week_hol_cache.clear()
-            _push_days_cache.clear()
             cfg = BuildConfig(
                 year,
                 month,
