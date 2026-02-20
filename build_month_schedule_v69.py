@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v68.py
+build_month_schedule_v69.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -49,6 +49,7 @@ Logic Changes (v34):
 - FIX (v66): Dynamic BU role scaling across changing roster sizes (no BU4 for 5-person teams) + repair pass counter correctness for BU fairness.
 - FIX (v67): Min weekday staffing is now dynamic (scales with roster size) and enforced only up to daily availability.
 - FIX (v68): Relax cross-month Sat AN -> Sun PN pairing when prior-month AN assignee is not in the active roster (supports roster changes).
+- FIX (v69): BU1 targets now use primary remainder rotation (PN->AN->W->BU1) to keep BU1 distribution aligned with primary fairness.
 """
 
 from __future__ import annotations
@@ -708,6 +709,25 @@ def compute_primary_targets(days, roster, sales_order, hols):
     return targets
 
 
+def compute_primary_remainder_offset(days, roster, hols):
+    if not roster:
+        raise ValueError("Roster cannot be empty when computing primary remainder offsets")
+
+    opp = {"PN": 0, "AN": 0, "W": 0}
+    for d in days:
+        req = roles_required_for_day(d, hols)
+        for r in opp:
+            if r in req:
+                opp[r] += 1
+
+    n = len(roster)
+    rem_pn = opp["PN"] % n
+    rem_an = opp["AN"] % n
+    rem_w = opp["W"] % n
+    bu1_offset = (rem_pn + rem_an + rem_w) % n
+    return bu1_offset
+
+
 def build_schedule(config: BuildConfig,
                    prev_sched: Dict[str, Dict[str, str]],
                    cons: Constraints,
@@ -720,6 +740,7 @@ def build_schedule(config: BuildConfig,
     
     hols = observed_holidays_for_year(year)
     targets = compute_primary_targets(days, config.roster, config.sales_order, hols)
+    bu1_offset = compute_primary_remainder_offset(days, config.roster, hols)
 
     schedule: Dict[str, Dict[str, str]] = {}
     role_counts = {r: {n: 0 for n in config.roster} for r in ["PN", "AN", "W"]}
@@ -1131,7 +1152,8 @@ def build_schedule(config: BuildConfig,
 
     bu_targets = {role: {p: 0 for p in config.roster} for role in bu_roles_present}
     roster_set = set(config.roster)
-    order = [x for x in config.sales_order if x in roster_set] + [x for x in config.roster if x not in config.sales_order]
+    base_order = [x for x in config.sales_order if x in roster_set] + [x for x in config.roster if x not in config.sales_order]
+    rotated_for_bu1 = _rotate_left(base_order, bu1_offset)
     for role in bu_roles_present:
         opps = bu_opps[role]
         if opps <= 0:
@@ -1140,8 +1162,9 @@ def build_schedule(config: BuildConfig,
         rem = opps % len(config.roster)
         for p in config.roster:
             bu_targets[role][p] = base
+        target_order = rotated_for_bu1 if role == "BU1" else base_order
         for i in range(rem):
-            bu_targets[role][order[i]] += 1
+            bu_targets[role][target_order[i]] += 1
 
     bu_counts = {role: {p: 0 for p in config.roster} for role in bu_roles_present}
     bu_weekday_counts = {role: {p: {i: 0 for i in range(7)} for p in config.roster} for role in bu_roles_present}
@@ -1182,7 +1205,8 @@ def build_schedule(config: BuildConfig,
         s -= total_hours[p] * 0.5
         s -= pp_hours(p, d) * 1.0
         if role in bu_targets:
-            s += (bu_targets[role][p] - bu_counts[role][p]) * 50.0
+            deficit_weight = 60.0 if role == 'BU1' else 50.0
+            s += (bu_targets[role][p] - bu_counts[role][p]) * deficit_weight
             s -= bu_weekday_counts[role][p][weekday_sun0(d)] * 10.0
         if role == 'BU1':
             # extra spread on Mondays (avoid the same BU1 on Mondays)
