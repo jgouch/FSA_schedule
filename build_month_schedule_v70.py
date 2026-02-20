@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v69.py
+build_month_schedule_v70.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -50,6 +50,7 @@ Logic Changes (v34):
 - FIX (v67): Min weekday staffing is now dynamic (scales with roster size) and enforced only up to daily availability.
 - FIX (v68): Relax cross-month Sat AN -> Sun PN pairing when prior-month AN assignee is not in the active roster (supports roster changes).
 - FIX (v69): BU1 targets now use primary remainder rotation (PN->AN->W->BU1) to keep BU1 distribution aligned with primary fairness.
+- FIX (v70): Auto-seed now enforces target weekday staffing when available by default (robust 4-when-available search).
 """
 
 from __future__ import annotations
@@ -2276,6 +2277,7 @@ def main():
                     help="Allow like-for-like primary swaps (PN/AN/W) across dates to free weekly capacity so a missing BU slot can be filled on an eligible weekday.")
     ap.add_argument("--weekday-target-repair-verbose", action="store_true")
     ap.add_argument("--enforce-target-when-available", action="store_true")
+    ap.add_argument("--no-enforce-target-when-available", action="store_true")
     args = ap.parse_args()
 
     year, month = parse_month_arg(args.month)
@@ -2299,9 +2301,21 @@ def main():
         if roster is None:
             roster = DEFAULT_ROSTER[:]
     if not target_weekday_staff_overridden:
-        args.target_weekday_staff = min(5, max(4, len(roster) - 1))
+        if len(roster) >= 4:
+            args.target_weekday_staff = 4
+        else:
+            args.target_weekday_staff = len(roster)
     if not min_weekday_staff_overridden:
         args.min_weekday_staff = default_min_weekday_staff(len(roster))
+
+    if args.auto_seed:
+        enforce_target = True
+        if args.no_enforce_target_when_available:
+            enforce_target = False
+        if args.enforce_target_when_available:
+            enforce_target = True
+    else:
+        enforce_target = args.enforce_target_when_available
 
     wb_for_sheet = openpyxl.load_workbook(args.timeoff_xlsx, data_only=True)
     try:
@@ -2441,7 +2455,7 @@ def main():
                     print(last_failure_reason)
                 continue
 
-            if args.enforce_target_when_available:
+            if enforce_target:
                 ok_target, reason_target = validate_target_when_available(
                     candidate,
                     year,
@@ -2505,7 +2519,7 @@ def main():
                 if assigned_count >= args.target_weekday_staff:
                     met_required_target_days += 1
 
-            if met_required_target_days == total_required_target_days:
+            if enforce_target and met_required_target_days == total_required_target_days:
                 perfect_found = True
 
             if perfect_found:
@@ -2513,7 +2527,10 @@ def main():
 
         if sched is None:
             raise RuntimeError(
-                f"Auto-seed failed for range [{seed_start}, {seed_end}]. Last failure: {last_failure_reason}"
+                f"Auto-seed failed for range [{seed_start}, {seed_end}] with "
+                f"target_weekday_staff={args.target_weekday_staff}, "
+                f"enforce_target_when_available={enforce_target}. "
+                f"Last failure: {last_failure_reason}"
             )
 
         print(f"✅ Auto-seed success: seed={winning_seed}")
