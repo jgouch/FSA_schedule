@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v53.py
+build_month_schedule_v54.py
 
 End-to-end month builder:
 - Reads TimeOff.xlsx (monthly request sheet + Sales Ranking tab)
@@ -36,6 +36,7 @@ Logic Changes (v34):
 - FIX (v51): default seed search capped at 50 attempts; add unconditional empty seed-range guard in auto-seed.
 - FIX (v52): add Weekday Target Repair Pass (BU-only micro-swaps within week) to improve eligible weekdays reaching target staffing.
 - FIX (v53): polish weekday target repair (clean placement, verbose logging, BU1 fairness counters, global BU1 precedence normalization).
+- FIX (v54): Resolve cross-month boundary bugs for holiday/push detection and DRY up BU ideal role logic.
 """
 
 from __future__ import annotations
@@ -214,14 +215,18 @@ def _rotate_left(lst: List[str], k: int) -> List[str]:
     return lst[k:] + lst[:k]
 
 # Global logic checks
-def week_contains_push(ws: date, push_days: Set[date]) -> bool:
+def week_contains_push(ws: date) -> bool:
     for i in range(7):
-        if (ws + timedelta(days=i)) in push_days: return True
+        d = ws + timedelta(days=i)
+        if d in get_push_days_for_month(d.year, d.month):
+            return True
     return False
 
-def week_contains_holiday(ws: date, hols: Set[date]) -> bool:
+def week_contains_holiday(ws: date) -> bool:
     for i in range(7):
-        if (ws + timedelta(days=i)) in hols: return True
+        d = ws + timedelta(days=i)
+        if d in observed_holidays_for_year(d.year):
+            return True
     return False
 
 # Global hours calculator (Single Source of Truth)
@@ -463,6 +468,30 @@ def push_days_for_month(year: int, month: int) -> Set[date]:
             days.add(cur)
     return days
 
+_push_days_cache = {}
+def get_push_days_for_month(year: int, month: int) -> Set[date]:
+    key = (year, month)
+    if key in _push_days_cache:
+        return _push_days_cache[key]
+    days = push_days_for_month(year, month)
+    _push_days_cache[key] = days
+    return days
+
+def ideal_bu_roles_for_day(d: date) -> List[str]:
+    if d in observed_holidays_for_year(d.year):
+        return []
+    if is_sunday(d):
+        return []
+    if d in get_push_days_for_month(d.year, d.month):
+        if is_saturday(d):
+            return ["BU1", "BU2", "BU3", "BU4"]
+        return ["BU1", "BU2", "BU3"]
+    if weekday_sun0(d) == 1:
+        return ["BU1", "BU2", "BU3"]
+    if is_weekday(d):
+        return ["BU1", "BU2"]
+    return []
+
 @dataclass
 class BuildConfig:
     year: int
@@ -641,7 +670,7 @@ def build_schedule(config: BuildConfig,
         
         # No consecutive Saturdays (any role) — relaxed during push/holiday weeks
         ws_sat = week_start_sun(d)
-        if is_saturday(d) and (not (week_contains_push(ws_sat, push_days) or week_contains_holiday(ws_sat, hols))) and calculate_daily_hours(d - timedelta(days=7), name, schedule, prev_sched, year, month) != 0: return False
+        if is_saturday(d) and (not (week_contains_push(ws_sat) or week_contains_holiday(ws_sat))) and calculate_daily_hours(d - timedelta(days=7), name, schedule, prev_sched, year, month) != 0: return False
         # B2B (Same Role) should mean previous CALENDAR day, not previous WORKED role
         prev_d = d - timedelta(days=1)
         prev_roles = schedule.get(prev_d.isoformat(), {})
@@ -689,8 +718,8 @@ def build_schedule(config: BuildConfig,
         # Push week relaxation: consecutive-days cap not enforced during push week
         
         ws = week_start_sun(d)
-        is_holiday_week = week_contains_holiday(ws, hols)
-        is_push_week = week_contains_push(ws, push_days)
+        is_holiday_week = week_contains_holiday(ws)
+        is_push_week = week_contains_push(ws)
         # Boundary safeguard: if this is the LAST day of the month and it's Saturday AN,
         # cross-month pairing forces next-day Sunday PN. Prevent exceeding max consecutive days.
         before, after = consecutive_span(name, d)
@@ -740,14 +769,14 @@ def build_schedule(config: BuildConfig,
         if role == 'BU1' and enforce_bu1_cap and bu1_counts[p] >= bu1_targets[p]: return False
         # No consecutive Saturdays (any role) — relaxed during push/holiday weeks
         ws_sat = week_start_sun(d)
-        if is_saturday(d) and (not (week_contains_push(ws_sat, push_days) or week_contains_holiday(ws_sat, hols))) and calculate_daily_hours(d - timedelta(days=7), p, schedule, prev_sched, year, month) != 0: return False
+        if is_saturday(d) and (not (week_contains_push(ws_sat) or week_contains_holiday(ws_sat))) and calculate_daily_hours(d - timedelta(days=7), p, schedule, prev_sched, year, month) != 0: return False
         # Push week relaxation: consecutive-days cap not enforced during push week
 
         ws = week_start_sun(d)
-        is_push = week_contains_push(ws, push_days)
+        is_push = week_contains_push(ws)
         before, after = consecutive_span(p, d)
         if (not is_push) and (before + 1 + after) > config.max_consecutive_days: return False
-        is_hol = week_contains_holiday(ws, hols)
+        is_hol = week_contains_holiday(ws)
         
         if not (is_push or is_hol):
              wh = week_hours(p, d)
@@ -767,7 +796,6 @@ def build_schedule(config: BuildConfig,
     def run_solver(strict_mode: bool) -> bool:
         sundays = [d for d in days if is_sunday(d) and d not in hols]
         month_sunday_count = {p: 0 for p in config.roster}
-        sunday_month_dup_used = False
 
         # 6-week rolling Sunday PN rotation across months, driven by actual prior schedules
         # This continues from the last actual Sunday PN in prev_sched, so manual edits are respected.
@@ -835,10 +863,7 @@ def build_schedule(config: BuildConfig,
                     role_counts['PN'][who] += 1
                     total_hours[who] += 5
                     pn_weekday_counts[who][0] += 1
-                    already_had_sunday = (month_sunday_count[who] >= 1)
                     month_sunday_count[who] += 1
-                    if allow_month_dup and already_had_sunday:
-                        sunday_month_dup_used = True
                     assigned_sunday = True
                     # Advance rotation based on actual assignment
                     rot_idx = (config.roster.index(who) + 1) % len(config.roster)
@@ -927,18 +952,7 @@ def build_schedule(config: BuildConfig,
     # especially across Mondays (avoid the same person always being BU1 on Mondays).
     bu1_opps = 0
     for _d in days:
-        if _d in hols or is_sunday(_d):
-            continue
-        # Determine if BU1 is expected on this day (same rules as BU fill)
-        if _d in push_days:
-            want_bu1 = True
-        elif weekday_sun0(_d) == 1:
-            want_bu1 = True
-        elif is_weekday(_d):
-            want_bu1 = True
-        else:
-            want_bu1 = False
-        if want_bu1:
+        if "BU1" in ideal_bu_roles_for_day(_d):
             bu1_opps += 1
 
     bu1_targets = {p: 0 for p in config.roster}
@@ -959,17 +973,6 @@ def build_schedule(config: BuildConfig,
     # --- end BU1 fairness ---
 
     # --- BU FILL ---
-    def ideal_bu_roles_for_day(d: date) -> List[str]:
-        if d in hols:
-            return []
-        if d in push_days:
-            return ["BU1", "BU2", "BU3", "BU4"] if is_saturday(d) else ["BU1", "BU2", "BU3"]
-        if weekday_sun0(d) == 1:
-            return ["BU1", "BU2", "BU3"]  # Mon
-        if is_weekday(d):
-            return ["BU1", "BU2"]  # Tue-Fri
-        return []
-
     bu_queue = []
     for d in days:
         ideal = ideal_bu_roles_for_day(d)
@@ -1091,7 +1094,7 @@ def build_schedule(config: BuildConfig,
             continue
 
         ws = week_start_sun(d)
-        is_relaxed_week = week_contains_push(ws, push_days) or week_contains_holiday(ws, hols)
+        is_relaxed_week = week_contains_push(ws) or week_contains_holiday(ws)
 
         # Easy win first: direct assignment if someone already passes all checks.
         direct_cands = [p for p in config.roster if can_bu(d, role, p)]
@@ -1244,11 +1247,8 @@ def build_schedule(config: BuildConfig,
         max_swap_attempts = 200
         max_attempts_per_day = 25
 
-        def expected_bu_roles_for_day(d: date) -> List[str]:
-            return ideal_bu_roles_for_day(d)
-
         def desired_role_for_repair(d: date) -> Optional[str]:
-            expected_roles = expected_bu_roles_for_day(d)
+            expected_roles = ideal_bu_roles_for_day(d)
             d_iso = d.isoformat()
             if "BU1" in expected_roles and "BU1" not in schedule[d_iso]:
                 return "BU1"
@@ -1259,7 +1259,7 @@ def build_schedule(config: BuildConfig,
 
         def normalize_bu1_skip(d: date):
             d_iso = d.isoformat()
-            expected_roles = expected_bu_roles_for_day(d)
+            expected_roles = ideal_bu_roles_for_day(d)
             if "BU1" not in expected_roles:
                 return
             if "BU1" in schedule[d_iso]:
@@ -1513,28 +1513,10 @@ def weekday_staff_metrics(
     }
 
 
-def expected_bu_roles_for_day(d: date, hols: Set[date], push_days: Set[date]) -> List[str]:
-    if d in hols:
-        return []
-    if is_sunday(d):
-        return []
-    if d in push_days:
-        if is_saturday(d):
-            return ["BU1", "BU2", "BU3", "BU4"]
-        return ["BU1", "BU2", "BU3"]
-    if weekday_sun0(d) == 1:
-        return ["BU1", "BU2", "BU3"]
-    if is_weekday(d):
-        return ["BU1", "BU2"]
-    return []
-
-
 def bu_deficit_metrics(
     schedule: Dict[str, Dict[str, str]],
     year: int,
     month: int,
-    hols: Set[date],
-    push_days: Set[date],
 ) -> Dict[str, int]:
     total_bu_missing = 0
     bu2_bu3_missing = 0
@@ -1542,7 +1524,7 @@ def bu_deficit_metrics(
 
     for d in month_days(year, month):
         day_roles = schedule.get(d.isoformat(), {})
-        for role in expected_bu_roles_for_day(d, hols, push_days):
+        for role in ideal_bu_roles_for_day(d):
             assigned = day_roles.get(role, "")
             if not str(assigned).strip():
                 total_bu_missing += 1
@@ -1570,7 +1552,7 @@ def weekly_over40_events(
     events = 0
     week_starts = sorted({week_start_sun(d) for d in month_days(year, month)})
     for ws in week_starts:
-        relaxed = week_contains_push(ws, push_days) or week_contains_holiday(ws, hols)
+        relaxed = week_contains_push(ws) or week_contains_holiday(ws)
         if relaxed:
             continue
         for person in roster:
@@ -1600,7 +1582,7 @@ def payperiod_over80_events(
         pp_relaxed = False
         cur_wk = week_start_sun(s)
         while cur_wk <= e:
-            if week_contains_push(cur_wk, push_days):
+            if week_contains_push(cur_wk):
                 pp_relaxed = True
                 break
             cur_wk += timedelta(days=7)
@@ -1653,7 +1635,7 @@ def audit_hours_caps(ws_vio, roster, week_starts, payperiods, hols, push_days, s
     
     # 1. Weekly check
     for ws_date in week_starts:
-        is_relaxed = week_contains_holiday(ws_date, hols) or week_contains_push(ws_date, push_days)
+        is_relaxed = week_contains_holiday(ws_date) or week_contains_push(ws_date)
         if is_relaxed: continue
         
         for p in roster:
@@ -1671,7 +1653,7 @@ def audit_hours_caps(ws_vio, roster, week_starts, payperiods, hols, push_days, s
             pp_relaxed = False
             cur_wk = week_start_sun(s)
             while cur_wk <= e:
-                if week_contains_push(cur_wk, push_days):
+                if week_contains_push(cur_wk):
                     pp_relaxed = True
                     break
                 cur_wk += timedelta(days=7)
@@ -2074,7 +2056,7 @@ def main():
                 winning_metrics = metrics
                 break
 
-            bu_metrics = bu_deficit_metrics(candidate, year, month, hols, push_days)
+            bu_metrics = bu_deficit_metrics(candidate, year, month)
             wk_over40 = weekly_over40_events(candidate, prev, roster, year, month, hols, push_days)
             pp_over80 = payperiod_over80_events(candidate, prev, roster, pps, year, month, push_days)
 
