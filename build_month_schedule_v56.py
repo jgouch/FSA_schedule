@@ -1443,6 +1443,7 @@ def build_schedule(config: BuildConfig,
             for action in repair_log["log"][:10]:
                 print(f"[weekday-target-repair] {action}")
 
+    # ALWAYS enforce BU1 precedence after all BU work (regardless of repair flag).
     normalize_bu1_precedence_all_days()
 
     # print("Warning: Could not fill all desired BU slots.")
