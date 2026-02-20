@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v66.py
+build_month_schedule_v67.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -47,6 +47,7 @@ Logic Changes (v34):
 - FIX (v64): primary swap micro-pass final failure block truly moved outside the candidate loop (corrected indentation).
 - FIX (v65): Dynamic staffing scaling for changing roster size + support FSA Schedule Info.xlsx workbook conventions (Roster/Sales Ranking/month request sheets).
 - FIX (v66): Dynamic BU role scaling across changing roster sizes (no BU4 for 5-person teams) + repair pass counter correctness for BU fairness.
+- FIX (v67): Min weekday staffing is now dynamic (scales with roster size) and enforced only up to daily availability.
 """
 
 from __future__ import annotations
@@ -223,6 +224,15 @@ def _rotate_left(lst: List[str], k: int) -> List[str]:
     if not lst: return lst
     k = k % len(lst)
     return lst[k:] + lst[:k]
+
+def default_min_weekday_staff(roster_size: int) -> int:
+    if roster_size <= 2:
+        return roster_size
+    if roster_size == 3:
+        return 3
+    if roster_size == 4:
+        return 3
+    return 4
 
 # Global logic checks
 _week_push_cache: Dict[date, bool] = {}
@@ -655,6 +665,7 @@ class BuildConfig:
     enable_primary_swap_repair: bool = False
     weekday_target_repair_verbose: bool = False
     target_weekday_staff: int = 5
+    min_weekday_staff: int = 4
 
 def compute_primary_targets(days, roster, sales_order, hols):
     if not roster:
@@ -1763,6 +1774,8 @@ def validate_min_weekday_staff(
     year: int,
     month: int,
     hols: Set[date],
+    roster: List[str],
+    cons: Constraints,
     min_staff: int = 4,
 ) -> Tuple[bool, str]:
     """Validate minimum unique weekday staffing coverage for the built schedule."""
@@ -1773,10 +1786,12 @@ def validate_min_weekday_staff(
         day_key = day.isoformat()
         day_roles = schedule.get(day_key, {})
         assigned_people = set(day_roles.values())
-        if len(assigned_people) < min_staff:
+        available_count = len(roster) - len(cons.hard_off.get(day, set()))
+        effective_min = min(min_staff, available_count)
+        if len(assigned_people) < effective_min:
             return (
                 False,
-                f"Weekday understaffed: {day_key} has {len(assigned_people)} unique people (<{min_staff}); roles={day_roles}",
+                f"Weekday understaffed: {day_key} has {len(assigned_people)} unique people (<{effective_min}, desired={min_staff}, available={available_count}); roles={day_roles}",
             )
 
     return True, "OK"
@@ -2231,6 +2246,10 @@ def main():
         a == "--target-weekday-staff" or a.startswith("--target-weekday-staff=")
         for a in sys.argv[1:]
     )
+    min_weekday_staff_overridden = any(
+        a == "--min-weekday-staff" or a.startswith("--min-weekday-staff=")
+        for a in sys.argv[1:]
+    )
     if args.roster_json:
         roster = load_roster_from_json(args.roster_json)
     else:
@@ -2244,6 +2263,8 @@ def main():
             roster = DEFAULT_ROSTER[:]
     if not target_weekday_staff_overridden:
         args.target_weekday_staff = min(5, max(4, len(roster) - 1))
+    if not min_weekday_staff_overridden:
+        args.min_weekday_staff = default_min_weekday_staff(len(roster))
 
     wb_for_sheet = openpyxl.load_workbook(args.timeoff_xlsx, data_only=True)
     try:
@@ -2287,6 +2308,7 @@ def main():
             enable_primary_swap_repair=args.primary_swap_repair,
             weekday_target_repair_verbose=args.weekday_target_repair_verbose,
             target_weekday_staff=args.target_weekday_staff,
+            min_weekday_staff=args.min_weekday_staff,
         )
         sched = build_schedule(cfg, prev, cons, pps)
     else:
@@ -2315,10 +2337,15 @@ def main():
             if d in hols or not is_weekday(d):
                 continue
             available_count = len(roster) - len(cons.hard_off.get(d, set()))
-            if available_count < args.min_weekday_staff:
+            required_roles = roles_required_for_day(d, hols)
+            requires_w = "W" in required_roles
+            if available_count < 2:
                 raise RuntimeError(
-                    f"Impossible to satisfy min weekday staff on {d.isoformat()}: "
-                    f"only {available_count} counselors available due to hard-off requests, need {args.min_weekday_staff}."
+                    f"Impossible staffing on {d.isoformat()}: only {available_count} counselors available due to hard-off requests; need at least 2 for PN/AN."
+                )
+            if requires_w and available_count < 3:
+                raise RuntimeError(
+                    f"Impossible staffing on {d.isoformat()}: only {available_count} counselors available due to hard-off requests; need at least 3 when W is required."
                 )
 
         sched = None
@@ -2353,6 +2380,7 @@ def main():
                 enable_primary_swap_repair=args.primary_swap_repair,
                 weekday_target_repair_verbose=args.weekday_target_repair_verbose,
                 target_weekday_staff=args.target_weekday_staff,
+                min_weekday_staff=args.min_weekday_staff,
             )
             if args.auto_seed_verbose:
                 print(f"Trying seed {seed}")
@@ -2369,6 +2397,8 @@ def main():
                 year,
                 month,
                 hols,
+                roster,
+                cons,
                 min_staff=args.min_weekday_staff,
             )
             if not ok:
