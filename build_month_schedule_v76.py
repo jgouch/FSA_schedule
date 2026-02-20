@@ -60,6 +60,9 @@ Logic Changes (v34):
 - FIX (v76): Auto-seed auto-enables weekday-target-repair when enforcing target staffing and expands default seed sweep; adds tight-day diagnostics showing when BU1 is required to reach target.
 """
 
+# Compile sanity check (warnings enabled):
+#   python3 -Wall -m py_compile build_month_schedule_v76.py
+
 from __future__ import annotations
 
 import argparse
