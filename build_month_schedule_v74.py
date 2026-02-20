@@ -55,6 +55,7 @@ Logic Changes (v34):
 - FIX (v72): Fix Sales Ranking quarter regex; ignore blank/None values in staffing validators; normalize prev-schedule names for Sunday rotation and cross-month comparisons.
 - FIX (v73): Auto-seed perfect-check ignores blank/None values; BU queue is solved hardest-first; auto-seed runs quietly unless verbose.
 - FIX (v74): Consistent unique-assignee counting; BU sequencing enforced (no BU2 without BU1) with hardest-first ordering; auto-seed catches all exceptions; BU compaction; misc guardrails.
+- FIX (v74.1): Standardize validator counting via helper; make final BU label normalization display-only (no counter mutation) and run precedence-before-compaction; align BU candidate counting with enqueue logic.
 """
 
 from __future__ import annotations
@@ -1206,18 +1207,12 @@ def build_schedule(config: BuildConfig,
     bu_queue = []
     for d in days:
         ideal = ideal_bu_roles_for_day(d, roster_size)
-        
-        if not ideal: continue
-
-        assigned = set(schedule[d.isoformat()].values())
-        hard = cons.hard_off.get(d, set())
-        pool = [p for p in config.roster if p not in assigned and p not in hard]
+        if not ideal:
+            continue
 
         for rname in ideal:
-            valid_cands = [p for p in pool if can_bu(d, rname, p)]
-            if rname == "BU1" and not valid_cands:
-                break
-            if rname != "BU1" and not valid_cands:
+            cands = [p for p in config.roster if can_bu(d, rname, p)]
+            if not cands:
                 break
             bu_queue.append((d, rname))
 
@@ -1480,8 +1475,6 @@ def build_schedule(config: BuildConfig,
                 p = schedule[d_iso]["BU2"]
                 schedule[d_iso]["BU1"] = p
                 del schedule[d_iso]["BU2"]
-                remove_bu_count(d, "BU2", p)
-                add_bu_count(d, "BU1", p)
 
     def weekday_target_repair_pass(
         schedule,
@@ -1830,13 +1823,13 @@ def build_schedule(config: BuildConfig,
             for action in repair_log["log"][:10]:
                 print(f"[weekday-target-repair] {action}")
 
+    # ALWAYS enforce BU1 precedence after all BU work (regardless of repair flag).
+    normalize_bu1_precedence_all_days()
+
     for d in days:
         if d in hols or is_sunday(d):
             continue
         compact_bu_for_day(d.isoformat())
-
-    # ALWAYS enforce BU1 precedence after all BU work (regardless of repair flag).
-    normalize_bu1_precedence_all_days()
 
     # print("Warning: Could not fill all desired BU slots.")
     print("\n--- Schedule Fairness Audit ---")
@@ -2023,7 +2016,7 @@ def validate_target_when_available(
             continue
         available = len(roster) - len(cons.hard_off.get(d, set()))
         if available >= target:
-            assigned_unique = len({v for v in schedule.get(d.isoformat(), {}).values() if v is not None and str(v).strip() != ""})
+            assigned_unique = unique_assignee_count(schedule.get(d.isoformat(), {}))
             if assigned_unique < target:
                 return (
                     False,
