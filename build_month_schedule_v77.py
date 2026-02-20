@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v76.py
+build_month_schedule_v77.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -58,10 +58,11 @@ Logic Changes (v34):
 - FIX (v74): Consistent unique-assignee counting; BU sequencing enforced (no BU2 without BU1) with hardest-first ordering; auto-seed catches all exceptions; BU compaction; misc guardrails.
 - FIX (v74.1): Standardize validator counting via helper; make final BU label normalization display-only (no counter mutation) and run precedence-before-compaction; align BU candidate counting with enqueue logic.
 - FIX (v76): Auto-seed auto-enables weekday-target-repair when enforcing target staffing and expands default seed sweep; adds tight-day diagnostics showing when BU1 is required to reach target.
+- FIX (v77): Enforce 4-unique weekday staffing when available_count >= 4 (only relax when <4); prioritize constrained days first; add progress heartbeat dot every 3 seconds.
 """
 
 # Compile sanity check (warnings enabled):
-#   python3 -Wall -m py_compile build_month_schedule_v76.py
+#   python3 -Wall -m py_compile build_month_schedule_v77.py
 
 from __future__ import annotations
 
@@ -73,6 +74,7 @@ import json
 import random
 import re
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -763,6 +765,21 @@ def build_schedule(config: BuildConfig,
     bu1_offset = compute_primary_remainder_offset(days, config.roster, hols)
 
     schedule: Dict[str, Dict[str, str]] = {}
+    day_difficulty: Dict[date, Tuple[int, int, int, int, date]] = {}
+    for d in days:
+        if d in hols or not is_weekday(d):
+            continue
+        hard_off = cons.hard_off.get(d, set())
+        available = len(config.roster) - len(hard_off)
+        tight = 1 if (available == config.target_weekday_staff) else 0
+        must_hit = 1 if (available >= config.target_weekday_staff) else 0
+        day_difficulty[d] = (
+            -must_hit,
+            -tight,
+            available,
+            -len(hard_off),
+            d,
+        )
     role_counts = {r: {n: 0 for n in config.roster} for r in ["PN", "AN", "W"]}
     total_hours = {n: 0 for n in config.roster}
     pn_weekday_counts = {n: {i: 0 for i in range(7)} for n in config.roster}
@@ -1109,11 +1126,13 @@ def build_schedule(config: BuildConfig,
 
 
         primary_slots = []
+        role_rank = {'PN': 0, 'AN': 1, 'W': 2}
         for d in days:
             req = roles_required_for_day(d, hols)
             for r in ["PN", "AN", "W"]:
                 if r in req and r not in schedule[d.isoformat()]:
                     primary_slots.append((d, r))
+        primary_slots.sort(key=lambda s: (day_difficulty.get(s[0], (0, 0, 99, 0, s[0])), role_rank[s[1]]))
         
         def count_candidates(slot):
             d, r = slot
@@ -1122,7 +1141,14 @@ def build_schedule(config: BuildConfig,
         def backtrack(slots_left):
             if not slots_left: return True
             
-            best_slot = min(slots_left, key=count_candidates)
+            best_slot = min(
+                slots_left,
+                key=lambda s: (
+                    count_candidates(s),
+                    day_difficulty.get(s[0], (0, 0, 99, 0, s[0])),
+                    role_rank[s[1]],
+                ),
+            )
             d, role = best_slot
             remaining_slots = [s for s in slots_left if s != best_slot]
             
@@ -2353,220 +2379,201 @@ def main():
     ap.add_argument("--no-enforce-target-when-available", action="store_true")
     args = ap.parse_args()
 
-    year, month = parse_month_arg(args.month)
-    target_weekday_staff_overridden = any(
-        a == "--target-weekday-staff" or a.startswith("--target-weekday-staff=")
-        for a in sys.argv[1:]
-    )
-    min_weekday_staff_overridden = any(
-        a == "--min-weekday-staff" or a.startswith("--min-weekday-staff=")
-        for a in sys.argv[1:]
-    )
-    if args.roster_json:
-        roster = load_roster_from_json(args.roster_json)
-    else:
-        roster = load_roster_from_timeoff_xlsx(
-            args.timeoff_xlsx,
-            args.roster_sheet,
-            year,
-            month,
-        )
-        if roster is None:
-            roster = DEFAULT_ROSTER[:]
-    if not target_weekday_staff_overridden:
-        if len(roster) < 4:
-            args.target_weekday_staff = len(roster)
-        else:
-            args.target_weekday_staff = min(5, max(4, len(roster) - 1))
-    if not min_weekday_staff_overridden:
-        args.min_weekday_staff = default_min_weekday_staff(len(roster))
+    stop_event = threading.Event()
 
-    if args.auto_seed:
-        enforce_target = True
-        if args.no_enforce_target_when_available:
-            enforce_target = False
-        if args.enforce_target_when_available:
-            enforce_target = True
-    else:
-        enforce_target = args.enforce_target_when_available
+    def heartbeat() -> None:
+        while not stop_event.is_set():
+            print('.', end='', file=sys.stderr, flush=True)
+            stop_event.wait(3.0)
 
-    weekday_repair_explicit = any(a == "--weekday-target-repair" for a in sys.argv[1:])
-    if args.auto_seed and enforce_target and (not weekday_repair_explicit) and (not args.no_weekday_target_repair):
-        args.weekday_target_repair = True
+    hb_thread = threading.Thread(target=heartbeat, daemon=True)
+    hb_thread.start()
 
-    wb_for_sheet = openpyxl.load_workbook(args.timeoff_xlsx, data_only=True)
     try:
-        month_sheet = f"{calendar.month_name[month]} Requests"
-        if args.timeoff_sheet in wb_for_sheet.sheetnames:
-            resolved_timeoff_sheet = args.timeoff_sheet
-        elif month_sheet in wb_for_sheet.sheetnames:
-            resolved_timeoff_sheet = month_sheet
+        year, month = parse_month_arg(args.month)
+        target_weekday_staff_overridden = any(
+            a == "--target-weekday-staff" or a.startswith("--target-weekday-staff=")
+            for a in sys.argv[1:]
+        )
+        min_weekday_staff_overridden = any(
+            a == "--min-weekday-staff" or a.startswith("--min-weekday-staff=")
+            for a in sys.argv[1:]
+        )
+        if args.roster_json:
+            roster = load_roster_from_json(args.roster_json)
         else:
-            raise ValueError(
-                f"Missing timeoff sheet names: '{args.timeoff_sheet}' and '{month_sheet}'. "
-                "Expected the default sheet or month request sheet pattern '<Month> Requests' (e.g., 'March Requests')."
+            roster = load_roster_from_timeoff_xlsx(
+                args.timeoff_xlsx,
+                args.roster_sheet,
+                year,
+                month,
             )
-    finally:
-        wb_for_sheet.close()
-
-    timeoff = load_timeoff_from_xlsx(args.timeoff_xlsx, resolved_timeoff_sheet)
-    cons = compile_constraints(timeoff)
-    sales = load_sales_ranking_from_timeoff_xlsx(args.timeoff_xlsx, args.sales_sheet, year, month, roster)
-    prev = load_schedule_json(args.prev_schedule)
-    if args.payperiods_json:
-        pps = load_payperiods_from_json(args.payperiods_json)
-    else:
-        ms = date(year, month, 1)
-        me = date(year, month, calendar.monthrange(year, month)[1])
-        anc = datetime.strptime(args.payperiod_anchor_start, "%Y-%m-%d").date()
-        raw = generate_payperiods(anc, ms - timedelta(days=28), me + timedelta(days=28))
-        pps = [p for p in raw if p[0] <= me and p[1] >= ms]
-    hols = observed_holidays_for_year(year)
-    if not args.auto_seed:
-        _week_push_cache.clear()
-        _week_hol_cache.clear()
-        _push_days_cache.clear()
-        cfg = BuildConfig(
-            year,
-            month,
-            roster,
-            sales,
-            rng_seed=args.seed,
-            enable_weekday_target_repair=args.weekday_target_repair,
-            enable_primary_swap_repair=args.primary_swap_repair,
-            weekday_target_repair_verbose=args.weekday_target_repair_verbose,
-            target_weekday_staff=args.target_weekday_staff,
-            min_weekday_staff=args.min_weekday_staff,
-        )
-        sched = build_schedule(cfg, prev, cons, pps)
-    else:
-        seed_start = args.seed_start
-        seed_end = args.seed_end
-        seed_end_overridden = any(
-            a == "--seed-end" or a.startswith("--seed-end=")
-            for a in sys.argv[1:]
-        )
-        max_attempts_overridden = any(
-            a == "--max-attempts" or a.startswith("--max-attempts=")
-            for a in sys.argv[1:]
-        )
-
-        if max_attempts_overridden:
-            if not seed_end_overridden:
-                seed_end = seed_start + args.max_attempts - 1
+            if roster is None:
+                roster = DEFAULT_ROSTER[:]
+        if not target_weekday_staff_overridden:
+            if len(roster) < 4:
+                args.target_weekday_staff = len(roster)
             else:
-                seed_end = min(seed_end, seed_start + args.max_attempts - 1)
+                args.target_weekday_staff = min(5, max(4, len(roster) - 1))
+        if not min_weekday_staff_overridden:
+            args.min_weekday_staff = default_min_weekday_staff(len(roster))
 
-        if args.auto_seed and enforce_target and (not seed_end_overridden) and (not max_attempts_overridden):
-            seed_end = max(seed_end, seed_start + 399)
+        if args.auto_seed:
+            enforce_target = True
+            if args.no_enforce_target_when_available:
+                enforce_target = False
+            if args.enforce_target_when_available:
+                enforce_target = True
+        else:
+            enforce_target = args.enforce_target_when_available
 
-        # Guard: prevent empty seed range (e.g., --seed-start > --seed-end)
-        if seed_start > seed_end:
-            raise ValueError("Resolved seed range is empty: ensure --seed-start <= --seed-end")
+        weekday_repair_explicit = any(a == "--weekday-target-repair" for a in sys.argv[1:])
+        if args.auto_seed and enforce_target and (not weekday_repair_explicit) and (not args.no_weekday_target_repair):
+            args.weekday_target_repair = True
 
-        for d in month_days(year, month):
-            if d in hols or not is_weekday(d):
-                continue
-            available_count = len(roster) - len(cons.hard_off.get(d, set()))
-            required_roles = roles_required_for_day(d, hols)
-            requires_w = "W" in required_roles
-            if available_count < 2:
-                raise RuntimeError(
-                    f"Impossible staffing on {d.isoformat()}: only {available_count} counselors available due to hard-off requests; need at least 2 for PN/AN."
+        wb_for_sheet = openpyxl.load_workbook(args.timeoff_xlsx, data_only=True)
+        try:
+            month_sheet = f"{calendar.month_name[month]} Requests"
+            if args.timeoff_sheet in wb_for_sheet.sheetnames:
+                resolved_timeoff_sheet = args.timeoff_sheet
+            elif month_sheet in wb_for_sheet.sheetnames:
+                resolved_timeoff_sheet = month_sheet
+            else:
+                raise ValueError(
+                    f"Missing timeoff sheet names: '{args.timeoff_sheet}' and '{month_sheet}'. "
+                    "Expected the default sheet or month request sheet pattern '<Month> Requests' (e.g., 'March Requests')."
                 )
-            if requires_w and available_count < 3:
-                raise RuntimeError(
-                    f"Impossible staffing on {d.isoformat()}: only {available_count} counselors available due to hard-off requests; need at least 3 when W is required."
-                )
+        finally:
+            wb_for_sheet.close()
 
-        sched = None
-        winning_seed = None
-        winning_metrics = None
-        winning_bu_metrics = None
-        winning_weekly_over40 = None
-        winning_payperiod_over80 = None
-        best_score = None
-        last_failure_reason = "No seeds attempted"
-        last_tight_day_lines: List[str] = []
-
-        total_required_target_days = 0
-        for d in month_days(year, month):
-            if d in hols or not is_weekday(d):
-                continue
-            available_count = len(roster) - len(cons.hard_off.get(d, set()))
-            if available_count >= args.target_weekday_staff:
-                total_required_target_days += 1
-
-        for seed in range(seed_start, seed_end + 1):
-            perfect_found = False
+        timeoff = load_timeoff_from_xlsx(args.timeoff_xlsx, resolved_timeoff_sheet)
+        cons = compile_constraints(timeoff)
+        sales = load_sales_ranking_from_timeoff_xlsx(args.timeoff_xlsx, args.sales_sheet, year, month, roster)
+        prev = load_schedule_json(args.prev_schedule)
+        if args.payperiods_json:
+            pps = load_payperiods_from_json(args.payperiods_json)
+        else:
+            ms = date(year, month, 1)
+            me = date(year, month, calendar.monthrange(year, month)[1])
+            anc = datetime.strptime(args.payperiod_anchor_start, "%Y-%m-%d").date()
+            raw = generate_payperiods(anc, ms - timedelta(days=28), me + timedelta(days=28))
+            pps = [p for p in raw if p[0] <= me and p[1] >= ms]
+        hols = observed_holidays_for_year(year)
+        if not args.auto_seed:
+            _week_push_cache.clear()
+            _week_hol_cache.clear()
+            _push_days_cache.clear()
             cfg = BuildConfig(
                 year,
                 month,
                 roster,
                 sales,
-                rng_seed=seed,
+                rng_seed=args.seed,
                 enable_weekday_target_repair=args.weekday_target_repair,
                 enable_primary_swap_repair=args.primary_swap_repair,
                 weekday_target_repair_verbose=args.weekday_target_repair_verbose,
                 target_weekday_staff=args.target_weekday_staff,
                 min_weekday_staff=args.min_weekday_staff,
             )
-            if args.auto_seed_verbose:
-                print(f"Trying seed {seed}")
-            try:
-                if args.auto_seed_verbose:
-                    candidate = build_schedule(cfg, prev, cons, pps)
-                else:
-                    buf = io.StringIO()
-                    with contextlib.redirect_stdout(buf):
-                        candidate = build_schedule(cfg, prev, cons, pps)
-            except Exception as e:
-                last_failure_reason = f"Seed {seed} failed to solve: {e}"
-                if args.auto_seed_verbose:
-                    print(last_failure_reason)
-                continue
-
-            ok, reason = validate_min_weekday_staff(
-                candidate,
-                year,
-                month,
-                hols,
-                roster,
-                cons,
-                min_staff=args.min_weekday_staff,
+            sched = build_schedule(cfg, prev, cons, pps)
+        else:
+            seed_start = args.seed_start
+            seed_end = args.seed_end
+            seed_end_overridden = any(
+                a == "--seed-end" or a.startswith("--seed-end=")
+                for a in sys.argv[1:]
             )
-            if not ok:
-                last_failure_reason = f"Seed {seed} failed validator: {reason}"
-                tight_lines = tight_day_diagnostics(
-                    candidate,
-                    year,
-                    month,
-                    hols,
-                    roster,
-                    cons,
-                    min(args.min_weekday_staff, args.target_weekday_staff),
-                )
-                last_tight_day_lines = tight_lines
-                if tight_lines:
-                    last_failure_reason += f" | {tight_lines[0]}"
-                if args.auto_seed_verbose:
-                    print(last_failure_reason)
-                    for line in tight_lines[:5]:
-                        print(f"[tight-day] {line}")
-                continue
+            max_attempts_overridden = any(
+                a == "--max-attempts" or a.startswith("--max-attempts=")
+                for a in sys.argv[1:]
+            )
 
-            if enforce_target:
-                ok_target, reason_target = validate_target_when_available(
-                    candidate,
+            if max_attempts_overridden:
+                if not seed_end_overridden:
+                    seed_end = seed_start + args.max_attempts - 1
+                else:
+                    seed_end = min(seed_end, seed_start + args.max_attempts - 1)
+
+            if args.auto_seed and enforce_target and (not seed_end_overridden) and (not max_attempts_overridden):
+                seed_end = max(seed_end, seed_start + 399)
+
+            # Guard: prevent empty seed range (e.g., --seed-start > --seed-end)
+            if seed_start > seed_end:
+                raise ValueError("Resolved seed range is empty: ensure --seed-start <= --seed-end")
+
+            for d in month_days(year, month):
+                if d in hols or not is_weekday(d):
+                    continue
+                available_count = len(roster) - len(cons.hard_off.get(d, set()))
+                required_roles = roles_required_for_day(d, hols)
+                requires_w = "W" in required_roles
+                if available_count < 2:
+                    raise RuntimeError(
+                        f"Impossible staffing on {d.isoformat()}: only {available_count} counselors available due to hard-off requests; need at least 2 for PN/AN."
+                    )
+                if requires_w and available_count < 3:
+                    raise RuntimeError(
+                        f"Impossible staffing on {d.isoformat()}: only {available_count} counselors available due to hard-off requests; need at least 3 when W is required."
+                    )
+
+            sched = None
+            winning_seed = None
+            winning_metrics = None
+            winning_bu_metrics = None
+            winning_weekly_over40 = None
+            winning_payperiod_over80 = None
+            best_score = None
+            last_failure_reason = "No seeds attempted"
+            last_tight_day_lines: List[str] = []
+
+            total_required_target_days = 0
+            for d in month_days(year, month):
+                if d in hols or not is_weekday(d):
+                    continue
+                available_count = len(roster) - len(cons.hard_off.get(d, set()))
+                if available_count >= args.target_weekday_staff:
+                    total_required_target_days += 1
+
+            for seed in range(seed_start, seed_end + 1):
+                perfect_found = False
+                cfg = BuildConfig(
                     year,
                     month,
                     roster,
-                    cons,
-                    hols,
-                    args.target_weekday_staff,
+                    sales,
+                    rng_seed=seed,
+                    enable_weekday_target_repair=args.weekday_target_repair,
+                    enable_primary_swap_repair=args.primary_swap_repair,
+                    weekday_target_repair_verbose=args.weekday_target_repair_verbose,
+                    target_weekday_staff=args.target_weekday_staff,
+                    min_weekday_staff=args.min_weekday_staff,
                 )
-                if not ok_target:
-                    last_failure_reason = f"Seed {seed} failed validator: {reason_target}"
+                if args.auto_seed_verbose:
+                    print(f"Trying seed {seed}")
+                try:
+                    if args.auto_seed_verbose:
+                        candidate = build_schedule(cfg, prev, cons, pps)
+                    else:
+                        buf = io.StringIO()
+                        with contextlib.redirect_stdout(buf):
+                            candidate = build_schedule(cfg, prev, cons, pps)
+                except Exception as e:
+                    last_failure_reason = f"Seed {seed} failed to solve: {e}"
+                    if args.auto_seed_verbose:
+                        print(last_failure_reason)
+                    continue
+
+                ok, reason = validate_min_weekday_staff(
+                    candidate,
+                    year,
+                    month,
+                    hols,
+                    roster,
+                    cons,
+                    min_staff=args.min_weekday_staff,
+                )
+                if not ok:
+                    last_failure_reason = f"Seed {seed} failed validator: {reason}"
                     tight_lines = tight_day_diagnostics(
                         candidate,
                         year,
@@ -2574,7 +2581,7 @@ def main():
                         hols,
                         roster,
                         cons,
-                        args.target_weekday_staff,
+                        min(args.min_weekday_staff, args.target_weekday_staff),
                     )
                     last_tight_day_lines = tight_lines
                     if tight_lines:
@@ -2585,117 +2592,151 @@ def main():
                             print(f"[tight-day] {line}")
                     continue
 
-            metrics = weekday_staff_metrics(
-                candidate,
-                year,
-                month,
-                hols,
-                roster,
-                cons,
-                target=args.target_weekday_staff,
-            )
+                if enforce_target:
+                    ok_target, reason_target = validate_target_when_available(
+                        candidate,
+                        year,
+                        month,
+                        roster,
+                        cons,
+                        hols,
+                        args.target_weekday_staff,
+                    )
+                    if not ok_target:
+                        last_failure_reason = f"Seed {seed} failed validator: {reason_target}"
+                        tight_lines = tight_day_diagnostics(
+                            candidate,
+                            year,
+                            month,
+                            hols,
+                            roster,
+                            cons,
+                            args.target_weekday_staff,
+                        )
+                        last_tight_day_lines = tight_lines
+                        if tight_lines:
+                            last_failure_reason += f" | {tight_lines[0]}"
+                        if args.auto_seed_verbose:
+                            print(last_failure_reason)
+                            for line in tight_lines[:5]:
+                                print(f"[tight-day] {line}")
+                        continue
 
-            if not args.optimize_weekday_staff:
-                sched = candidate
-                winning_seed = seed
-                winning_metrics = metrics
-                break
-
-            bu_metrics = bu_deficit_metrics(candidate, year, month, len(roster))
-            wk_over40 = weekly_over40_events(candidate, prev, roster, year, month)
-            pp_over80 = payperiod_over80_events(candidate, prev, roster, pps, year, month)
-
-            score = (
-                metrics["eligible_days_with_target_or_more"],
-                -metrics["eligible_deficit_sum_to_target"],
-                -bu_metrics["bu2_bu3_missing"],
-                -bu_metrics["total_bu_missing"],
-                -wk_over40,
-                -pp_over80,
-            )
-            if best_score is None or score > best_score:
-                best_score = score
-                sched = candidate
-                winning_seed = seed
-                winning_metrics = metrics
-                winning_bu_metrics = bu_metrics
-                winning_weekly_over40 = wk_over40
-                winning_payperiod_over80 = pp_over80
-
-            met_required_target_days = 0
-            for d in month_days(year, month):
-                if d in hols or not is_weekday(d):
-                    continue
-                available_count = len(roster) - len(cons.hard_off.get(d, set()))
-                if available_count < args.target_weekday_staff:
-                    continue
-                assigned_count = unique_assignee_count(candidate.get(d.isoformat(), {}))
-                if assigned_count >= args.target_weekday_staff:
-                    met_required_target_days += 1
-
-            if enforce_target and met_required_target_days == total_required_target_days:
-                perfect_found = True
-
-            if perfect_found:
-                break
-
-        if sched is None:
-            final_tight_lines = last_tight_day_lines[:]
-            hint = (
-                "Hint: enforcement requires reaching target unique staffing on eligible weekdays; "
-                "a 4th unique person typically comes from BU1. Try --weekday-target-repair and/or "
-                "increase --seed-end. "
-                f"Resolved: weekday_target_repair={args.weekday_target_repair}, "
-                f"seed_range=[{seed_start}, {seed_end}], enforce_target={enforce_target}"
-            )
-            tight_suffix = ""
-            if final_tight_lines:
-                tight_suffix = " Tight days: " + " | ".join(final_tight_lines[:5])
-            raise RuntimeError(
-                f"Auto-seed failed for range [{seed_start}, {seed_end}] with "
-                f"target_weekday_staff={args.target_weekday_staff}, "
-                f"enforce_target_when_available={enforce_target}. "
-                f"Last failure: {last_failure_reason}. {hint}{tight_suffix}"
-            )
-
-        print(f"✅ Auto-seed success: seed={winning_seed}")
-        if args.optimize_weekday_staff and winning_metrics is not None:
-            if winning_metrics["eligible_weekdays_checked"] == 0:
-                print(
-                    f"Weekday staffing: no eligible weekdays for target={args.target_weekday_staff} "
-                    f"this month (availability <{args.target_weekday_staff} on all weekdays)."
-                )
-            else:
-                print(
-                    f"Weekday staffing: {winning_metrics['eligible_days_with_target_or_more']}/"
-                    f"{winning_metrics['eligible_weekdays_checked']} eligible weekdays meet "
-                    f"target={args.target_weekday_staff}, min eligible weekday assigned="
-                    f"{winning_metrics['eligible_min_assigned_on_weekday']}"
-                )
-            if winning_bu_metrics is not None:
-                print(
-                    "BU deficits: "
-                    f"BU2/BU3 missing={winning_bu_metrics['bu2_bu3_missing']}, "
-                    f"total BU missing={winning_bu_metrics['total_bu_missing']}"
-                )
-            if winning_weekly_over40 is not None and winning_payperiod_over80 is not None:
-                print(
-                    "Hours over caps (non-relaxed): "
-                    f"weekly>40 events={winning_weekly_over40}, "
-                    f"payperiod>80 events={winning_payperiod_over80}"
+                metrics = weekday_staff_metrics(
+                    candidate,
+                    year,
+                    month,
+                    hols,
+                    roster,
+                    cons,
+                    target=args.target_weekday_staff,
                 )
 
-    oj = args.out_json or str(Path(args.prev_schedule).with_name(f"{year}_{month:02d}_schedule.json"))
-    ox = args.out_xlsx or str(Path(args.prev_schedule).with_name(f"{calendar.month_name[month]}_{year}_Schedule.xlsx"))
+                if not args.optimize_weekday_staff:
+                    sched = candidate
+                    winning_seed = seed
+                    winning_metrics = metrics
+                    break
 
-    Path(oj).write_text(json.dumps(sched, indent=2), "utf-8")
-    print(f"✅ JSON: {oj}")
+                bu_metrics = bu_deficit_metrics(candidate, year, month, len(roster))
+                wk_over40 = weekly_over40_events(candidate, prev, roster, year, month)
+                pp_over80 = payperiod_over80_events(candidate, prev, roster, pps, year, month)
 
-    export_to_excel(
-        sched, year, month, ox, roster, hols,
-        prev, pps, sales, cons, template_xlsx=args.template_xlsx
-    )
-    print(f"✅ Excel: {ox}")
+                score = (
+                    metrics["eligible_days_with_target_or_more"],
+                    -metrics["eligible_deficit_sum_to_target"],
+                    -bu_metrics["bu2_bu3_missing"],
+                    -bu_metrics["total_bu_missing"],
+                    -wk_over40,
+                    -pp_over80,
+                )
+                if best_score is None or score > best_score:
+                    best_score = score
+                    sched = candidate
+                    winning_seed = seed
+                    winning_metrics = metrics
+                    winning_bu_metrics = bu_metrics
+                    winning_weekly_over40 = wk_over40
+                    winning_payperiod_over80 = pp_over80
+
+                met_required_target_days = 0
+                for d in month_days(year, month):
+                    if d in hols or not is_weekday(d):
+                        continue
+                    available_count = len(roster) - len(cons.hard_off.get(d, set()))
+                    if available_count < args.target_weekday_staff:
+                        continue
+                    assigned_count = unique_assignee_count(candidate.get(d.isoformat(), {}))
+                    if assigned_count >= args.target_weekday_staff:
+                        met_required_target_days += 1
+
+                if enforce_target and met_required_target_days == total_required_target_days:
+                    perfect_found = True
+
+                if perfect_found:
+                    break
+
+            if sched is None:
+                final_tight_lines = last_tight_day_lines[:]
+                hint = (
+                    "Hint: enforcement requires reaching target unique staffing on eligible weekdays; "
+                    "a 4th unique person typically comes from BU1. Try --weekday-target-repair and/or "
+                    "increase --seed-end. "
+                    f"Resolved: weekday_target_repair={args.weekday_target_repair}, "
+                    f"seed_range=[{seed_start}, {seed_end}], enforce_target={enforce_target}"
+                )
+                tight_suffix = ""
+                if final_tight_lines:
+                    tight_suffix = " Tight days: " + " | ".join(final_tight_lines[:5])
+                raise RuntimeError(
+                    f"Auto-seed failed for range [{seed_start}, {seed_end}] with "
+                    f"target_weekday_staff={args.target_weekday_staff}, "
+                    f"enforce_target_when_available={enforce_target}. "
+                    f"Last failure: {last_failure_reason}. {hint}{tight_suffix}"
+                )
+
+            print(f"✅ Auto-seed success: seed={winning_seed}")
+            if args.optimize_weekday_staff and winning_metrics is not None:
+                if winning_metrics["eligible_weekdays_checked"] == 0:
+                    print(
+                        f"Weekday staffing: no eligible weekdays for target={args.target_weekday_staff} "
+                        f"this month (availability <{args.target_weekday_staff} on all weekdays)."
+                    )
+                else:
+                    print(
+                        f"Weekday staffing: {winning_metrics['eligible_days_with_target_or_more']}/"
+                        f"{winning_metrics['eligible_weekdays_checked']} eligible weekdays meet "
+                        f"target={args.target_weekday_staff}, min eligible weekday assigned="
+                        f"{winning_metrics['eligible_min_assigned_on_weekday']}"
+                    )
+                if winning_bu_metrics is not None:
+                    print(
+                        "BU deficits: "
+                        f"BU2/BU3 missing={winning_bu_metrics['bu2_bu3_missing']}, "
+                        f"total BU missing={winning_bu_metrics['total_bu_missing']}"
+                    )
+                if winning_weekly_over40 is not None and winning_payperiod_over80 is not None:
+                    print(
+                        "Hours over caps (non-relaxed): "
+                        f"weekly>40 events={winning_weekly_over40}, "
+                        f"payperiod>80 events={winning_payperiod_over80}"
+                    )
+
+        oj = args.out_json or str(Path(args.prev_schedule).with_name(f"{year}_{month:02d}_schedule.json"))
+        ox = args.out_xlsx or str(Path(args.prev_schedule).with_name(f"{calendar.month_name[month]}_{year}_Schedule.xlsx"))
+
+        Path(oj).write_text(json.dumps(sched, indent=2), "utf-8")
+        print(f"✅ JSON: {oj}")
+
+        export_to_excel(
+            sched, year, month, ox, roster, hols,
+            prev, pps, sales, cons, template_xlsx=args.template_xlsx
+        )
+        print(f"✅ Excel: {ox}")
+    finally:
+        stop_event.set()
+        hb_thread.join(timeout=1.0)
+        print('', file=sys.stderr)
 
 
 if __name__ == "__main__":
