@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v64.py
+build_month_schedule_v65.py
 
 End-to-end month builder:
-- Reads TimeOff.xlsx (monthly request sheet + Sales Ranking tab)
+- Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
 - Reads prior month schedule JSON for cross-month constraints
 - Generates schedule for target month (primaries then BU)
 - Exports:
@@ -45,6 +45,7 @@ Logic Changes (v34):
 - FIX (v61): primary swap micro-pass now correctly tries all candidate people before failing (dedent final return False outside the candidate loop).
 - FIX (v62): primary swap micro-pass final failure return moved outside candidate loop (correct indentation).
 - FIX (v64): primary swap micro-pass final failure block truly moved outside the candidate loop (corrected indentation).
+- FIX (v65): Dynamic staffing scaling for changing roster size + support FSA Schedule Info.xlsx workbook conventions (Roster/Sales Ranking/month request sheets).
 """
 
 from __future__ import annotations
@@ -483,29 +484,56 @@ def load_sales_ranking_from_timeoff_xlsx(xlsx_path, sheet_name, year, month, ros
         if sheet_name not in wb.sheetnames:
             raise ValueError(f"Missing sheet '{sheet_name}'")
         ws = wb[sheet_name]
-        target = normalize_quarter_key(quarter_tag_for_month(year, month))
-
-        rows = {}
+        cutoff = date(year, month, 1) - timedelta(days=1)
+        parsed_rows = []
+        fallback_rows = []
         for r in range(2, ws.max_row + 1):
             p = ws.cell(r, 1).value
-            if not p: continue
-            p = normalize_quarter_key(str(p))
+            if not p:
+                continue
             ranks = []
             for c in range(2, ws.max_column + 1):
                 v = ws.cell(r, c).value
                 if v and str(v).strip():
                     ranks.append(norm_name(v))
-            if ranks: rows[p] = ranks
+            if not ranks:
+                continue
 
-        def key(x):
-            # Support both raw values ("2026 Q1") and normalized values ("2026Q1").
-            m = re.match(r"^(\d{4})Q([1-4])$", normalize_quarter_key(x))
-            return (int(m.group(1)), int(m.group(2))) if m else (0,0)
+            fallback_rows.append((r, p, ranks))
 
-        order = rows.get(target)
-        if not order:
-            candidates = sorted(rows.keys(), key=key)
-            if candidates: order = rows[candidates[-1]]
+            period_end: Optional[date] = None
+            try:
+                pd = parse_excel_date(p)
+                period_end = date(pd.year, pd.month, calendar.monthrange(pd.year, pd.month)[1])
+            except Exception:
+                s = str(p).strip()
+                qm = re.match(r"^(\d{4})\s*Q([1-4])$", s, flags=re.IGNORECASE)
+                if qm:
+                    qy = int(qm.group(1))
+                    qn = int(qm.group(2))
+                    q_end_month = qn * 3
+                    period_end = date(qy, q_end_month, calendar.monthrange(qy, q_end_month)[1])
+                else:
+                    mm = re.match(r"^(\d{4})-(\d{2})$", s)
+                    if mm:
+                        my = int(mm.group(1))
+                        mmn = int(mm.group(2))
+                        if 1 <= mmn <= 12:
+                            period_end = date(my, mmn, calendar.monthrange(my, mmn)[1])
+
+            if period_end is not None:
+                parsed_rows.append((period_end, r, ranks))
+
+        order = None
+        closed_rows = [item for item in parsed_rows if item[0] <= cutoff]
+        if closed_rows:
+            closed_rows.sort(key=lambda t: (t[0], t[1]))
+            order = closed_rows[-1][2]
+        elif parsed_rows:
+            parsed_rows.sort(key=lambda t: (t[0], t[1]))
+            order = parsed_rows[-1][2]
+        elif fallback_rows:
+            order = fallback_rows[-1][2]
 
         roster_set = set(roster_names)
         if not order:
@@ -578,12 +606,25 @@ def get_push_days_for_month(year: int, month: int) -> Set[date]:
     _push_days_cache[key] = days
     return days
 
-def ideal_bu_roles_for_day(d: date) -> List[str]:
+def ideal_bu_roles_for_day(d: date, roster_size: int) -> List[str]:
     if d in observed_holidays_for_year(d.year):
         return []
     if is_sunday(d):
         return []
-    if d in get_push_days_for_month(d.year, d.month):
+    is_push_day = d in get_push_days_for_month(d.year, d.month)
+    if roster_size <= 5:
+        if is_push_day:
+            if is_saturday(d):
+                return ["BU1", "BU2", "BU4"]
+            if weekday_sun0(d) in {1, 2, 3, 4, 5}:
+                return ["BU1", "BU2"]
+        if weekday_sun0(d) == 1:
+            return ["BU1", "BU2"]
+        if is_weekday(d):
+            return ["BU1"]
+        return []
+
+    if is_push_day:
         if is_saturday(d):
             return ["BU1", "BU2", "BU3", "BU4"]
         return ["BU1", "BU2", "BU3"]
@@ -868,7 +909,7 @@ def build_schedule(config: BuildConfig,
         if d in hols: return False
         if p in cons.hard_off.get(d, set()): return False
         if p in schedule[d.isoformat()].values(): return False
-        if role == 'BU1' and enforce_bu1_cap and bu1_counts[p] >= bu1_targets[p]: return False
+        if role == 'BU1' and enforce_bu1_cap and bu_targets.get('BU1', {}).get(p, 0) > 0 and bu_counts['BU1'][p] >= bu_targets['BU1'][p]: return False
         # No consecutive Saturdays (any role) — relaxed during push/holiday weeks
         ws_sat = week_start_sun(d)
         if is_saturday(d) and (not (week_contains_push(ws_sat) or week_contains_holiday(ws_sat))) and calculate_daily_hours(d - timedelta(days=7), p, schedule, prev_sched, year, month) != 0: return False
@@ -1049,35 +1090,47 @@ def build_schedule(config: BuildConfig,
         print(">> Strict solve successful.")
 
     
-    # --- BU1 fairness (treat BU1 as a primary-like role) ---
-    # We compute monthly BU1 targets and bias/limit BU1 assignment to keep it balanced,
-    # especially across Mondays (avoid the same person always being BU1 on Mondays).
-    bu1_opps = 0
+    roster_size = len(config.roster)
+    bu_roles_present = sorted({role for d in days for role in ideal_bu_roles_for_day(d, roster_size)})
+    bu_opps = {role: 0 for role in bu_roles_present}
     for _d in days:
-        if "BU1" in ideal_bu_roles_for_day(_d):
-            bu1_opps += 1
+        for role in ideal_bu_roles_for_day(_d, roster_size):
+            bu_opps[role] += 1
 
-    bu1_targets = {p: 0 for p in config.roster}
-    if bu1_opps > 0:
-        base = bu1_opps // len(config.roster)
-        rem = bu1_opps % len(config.roster)
+    bu_targets = {role: {p: 0 for p in config.roster} for role in bu_roles_present}
+    roster_set = set(config.roster)
+    order = [x for x in config.sales_order if x in roster_set] + [x for x in config.roster if x not in config.sales_order]
+    for role in bu_roles_present:
+        opps = bu_opps[role]
+        if opps <= 0:
+            continue
+        base = opps // len(config.roster)
+        rem = opps % len(config.roster)
         for p in config.roster:
-            bu1_targets[p] = base
-        # Remainder uses sales_order (already derived from Sales Ranking) for stable tie-breaking
-        roster_set = set(config.roster)
-        order = [x for x in config.sales_order if x in roster_set] + [x for x in config.roster if x not in config.sales_order]
+            bu_targets[role][p] = base
         for i in range(rem):
-            bu1_targets[order[i]] += 1
+            bu_targets[role][order[i]] += 1
 
-    bu1_counts = {p: 0 for p in config.roster}
-    bu1_weekday_counts = {p: {i: 0 for i in range(7)} for p in config.roster}
+    bu_counts = {role: {p: 0 for p in config.roster} for role in bu_roles_present}
+    bu_weekday_counts = {role: {p: {i: 0 for i in range(7)} for p in config.roster} for role in bu_roles_present}
     enforce_bu1_cap = True
-    # --- end BU1 fairness ---
+
+    def add_bu_count(d: date, role: str, person: str):
+        if role not in bu_counts:
+            return
+        bu_counts[role][person] += 1
+        bu_weekday_counts[role][person][weekday_sun0(d)] += 1
+
+    def remove_bu_count(d: date, role: str, person: str):
+        if role not in bu_counts:
+            return
+        bu_counts[role][person] -= 1
+        bu_weekday_counts[role][person][weekday_sun0(d)] -= 1
 
     # --- BU FILL ---
     bu_queue = []
     for d in days:
-        ideal = ideal_bu_roles_for_day(d)
+        ideal = ideal_bu_roles_for_day(d, roster_size)
         
         if not ideal: continue
 
@@ -1095,14 +1148,13 @@ def build_schedule(config: BuildConfig,
         s = rng.random()
         s -= total_hours[p] * 0.5
         s -= pp_hours(p, d) * 1.0
+        if role in bu_targets:
+            s += (bu_targets[role][p] - bu_counts[role][p]) * 50.0
+            s -= bu_weekday_counts[role][p][weekday_sun0(d)] * 10.0
         if role == 'BU1':
-            # prefer people under their BU1 target
-            s += (bu1_targets[p] - bu1_counts[p]) * 50.0
-            # spread BU1 across weekdays
-            s -= bu1_weekday_counts[p][weekday_sun0(d)] * 10.0
             # extra spread on Mondays (avoid the same BU1 on Mondays)
             if weekday_sun0(d) == 1:
-                s -= bu1_weekday_counts[p][1] * 25.0
+                s -= bu_weekday_counts['BU1'][p][1] * 25.0
         if p in cons.avoid_roles.get((d, role), set()): s -= 1000.0
         # Soft B2B preference for BU: discourage repeats but NEVER block filling BU.
         prev_d = d - timedelta(days=1)
@@ -1127,18 +1179,14 @@ def build_schedule(config: BuildConfig,
         for p in cands:
             schedule[d.isoformat()][role] = p
             total_hours[p] += 8
-            if role == 'BU1':
-                bu1_counts[p] += 1
-                bu1_weekday_counts[p][weekday_sun0(d)] += 1
+            add_bu_count(d, role, p)
 
             if solve_bu(idx + 1):
                 return True
 
             del schedule[d.isoformat()][role]
             total_hours[p] -= 8
-            if role == 'BU1':
-                bu1_counts[p] -= 1
-                bu1_weekday_counts[p][weekday_sun0(d)] -= 1
+            remove_bu_count(d, role, p)
 
         return False
 
@@ -1150,11 +1198,13 @@ def build_schedule(config: BuildConfig,
             for d_iso2 in list(schedule.keys()):
                 for k in ['BU1','BU2','BU3','BU4']:
                     schedule[d_iso2].pop(k, None)
-            for p2 in bu1_counts:
-                bu1_counts[p2] = 0
-            for p2 in bu1_weekday_counts:
-                for wd in bu1_weekday_counts[p2]:
-                    bu1_weekday_counts[p2][wd] = 0
+            for role_name in bu_counts:
+                for p2 in bu_counts[role_name]:
+                    bu_counts[role_name][p2] = 0
+            for role_name in bu_weekday_counts:
+                for p2 in bu_weekday_counts[role_name]:
+                    for wd in bu_weekday_counts[role_name][p2]:
+                        bu_weekday_counts[role_name][p2][wd] = 0
             bu_fill_success = solve_bu(0)
             if bu_fill_success:
                 print("BU fill successful after relaxing BU1 cap.")
@@ -1176,17 +1226,17 @@ def build_schedule(config: BuildConfig,
                 pick = cands[0]
                 schedule[d_iso][role] = pick
                 total_hours[pick] += 8
-                if role == 'BU1':
-                    bu1_counts[pick] += 1
-                    bu1_weekday_counts[pick][weekday_sun0(d)] += 1
+                add_bu_count(d, role, pick)
             # --- end greedy fallback ---
 
-    # --- BU REPAIR PASS (BU2/BU3 only) ---
+    # --- BU REPAIR PASS ---
     bu_repair_swaps = []
+    repair_roles = {"BU2", "BU4"} if roster_size <= 5 else {"BU2", "BU3"}
     deficits = []
     for d in days:
-        for role in ideal_bu_roles_for_day(d):
-            if role in {'BU2', 'BU3'} and role not in schedule[d.isoformat()]:
+        expected = ideal_bu_roles_for_day(d, roster_size)
+        for role in expected:
+            if role in repair_roles and role not in schedule[d.isoformat()]:
                 deficits.append((d, role))
     before_deficits = len(deficits)
 
@@ -1227,13 +1277,13 @@ def build_schedule(config: BuildConfig,
             if p in cons.hard_off.get(d, set()):
                 continue
 
-            # Try to free one BU2/BU3 assignment for p inside the same week.
+            # Try to free one BU assignment for p inside the same week.
             move_options = []
             for d2 in week_days:
                 d2_iso = d2.isoformat()
                 if d2_iso not in schedule:
                     continue
-                for moved_role in ('BU2', 'BU3'):
+                for moved_role in tuple(repair_roles):
                     if schedule[d2_iso].get(moved_role) == p:
                         move_options.append((d2, moved_role))
 
@@ -1295,13 +1345,14 @@ def build_schedule(config: BuildConfig,
 
     remaining_deficits = []
     for d in days:
-        for role in ideal_bu_roles_for_day(d):
-            if role in {'BU2', 'BU3'} and role not in schedule[d.isoformat()]:
+        expected = ideal_bu_roles_for_day(d, roster_size)
+        for role in expected:
+            if role in repair_roles and role not in schedule[d.isoformat()]:
                 remaining_deficits.append((d, role))
     after_deficits = len(remaining_deficits)
     print("\n--- BU Repair Pass Summary ---")
-    print(f"BU2/BU3 deficits before repair: {before_deficits}")
-    print(f"BU2/BU3 deficits after repair: {after_deficits}")
+    print(f"{sorted(repair_roles)} deficits before repair: {before_deficits}")
+    print(f"{sorted(repair_roles)} deficits after repair: {after_deficits}")
     if bu_repair_swaps:
         for item in bu_repair_swaps:
             if item["type"] == "direct":
@@ -1312,11 +1363,11 @@ def build_schedule(config: BuildConfig,
                     f"by moving {item['moved_role']} on {item['moved_day']} from {item['moved_from']} to {item['moved_to']}"
                 )
     else:
-        print("No BU2/BU3 repair swaps performed.")
+        print("No BU repair swaps performed.")
 
     def normalize_bu1_precedence_all_days():
         for d in month_days(year, month):
-            expected_roles = ideal_bu_roles_for_day(d)
+            expected_roles = ideal_bu_roles_for_day(d, roster_size)
             if "BU1" not in expected_roles:
                 continue
             d_iso = d.isoformat()
@@ -1326,8 +1377,8 @@ def build_schedule(config: BuildConfig,
                 p = schedule[d_iso]["BU2"]
                 schedule[d_iso]["BU1"] = p
                 del schedule[d_iso]["BU2"]
-                bu1_counts[p] += 1
-                bu1_weekday_counts[p][weekday_sun0(d)] += 1
+                remove_bu_count(d, "BU2", p)
+                add_bu_count(d, "BU1", p)
 
     def weekday_target_repair_pass(
         schedule,
@@ -1349,7 +1400,7 @@ def build_schedule(config: BuildConfig,
         max_attempts_per_day = 25
 
         def next_missing_expected_bu_role(d: date) -> Optional[str]:
-            expected = ideal_bu_roles_for_day(d)
+            expected = ideal_bu_roles_for_day(d, roster_size)
             d_iso = d.isoformat()
             for role in ("BU1", "BU2", "BU3", "BU4"):
                 if role in expected and role not in schedule[d_iso]:
@@ -1358,7 +1409,7 @@ def build_schedule(config: BuildConfig,
 
         def normalize_bu1_skip(d: date):
             d_iso = d.isoformat()
-            expected_roles = ideal_bu_roles_for_day(d)
+            expected_roles = ideal_bu_roles_for_day(d, roster_size)
             if "BU1" not in expected_roles:
                 return
             if "BU1" in schedule[d_iso]:
@@ -1367,16 +1418,14 @@ def build_schedule(config: BuildConfig,
                 p = schedule[d_iso]["BU2"]
                 schedule[d_iso]["BU1"] = p
                 del schedule[d_iso]["BU2"]
-                bu1_counts[p] += 1
-                bu1_weekday_counts[p][weekday_sun0(d)] += 1
+                remove_bu_count(d, "BU2", p)
+                add_bu_count(d, "BU1", p)
 
         def add_bu1_count(d: date, person: str):
-            bu1_counts[person] += 1
-            bu1_weekday_counts[person][weekday_sun0(d)] += 1
+            add_bu_count(d, "BU1", person)
 
         def remove_bu1_count(d: date, person: str):
-            bu1_counts[person] -= 1
-            bu1_weekday_counts[person][weekday_sun0(d)] -= 1
+            remove_bu_count(d, "BU1", person)
 
         def attempt_primary_swap_to_free_capacity(target_day: date, desired_bu_role: str) -> bool:
             """
@@ -1470,8 +1519,7 @@ def build_schedule(config: BuildConfig,
                             if can_bu(d, desired_bu_role, p):
                                 schedule[d_iso][desired_bu_role] = p
                                 total_hours[p] += 8
-                                if desired_bu_role == "BU1":
-                                    add_bu1_count(d, p)
+                                add_bu_count(d, desired_bu_role, p)
                                 normalize_bu1_skip(d)
                                 moves_performed += 3
                                 if verbose:
@@ -1538,8 +1586,7 @@ def build_schedule(config: BuildConfig,
                     pick = direct_cands[0]
                     schedule[d_iso][desired_role] = pick
                     total_hours[pick] += 8
-                    if desired_role == "BU1":
-                        add_bu1_count(d, pick)
+                    add_bu_count(d, desired_role, pick)
                     normalize_bu1_skip(d)
                     post_unique = len(set(schedule[d_iso].values()))
                     if post_unique > pre_unique:
@@ -1595,15 +1642,13 @@ def build_schedule(config: BuildConfig,
                             schedule[d2_iso][r2] = y
                             total_hours[x] -= 8
                             total_hours[y] += 8
-                            if r2 == "BU1":
-                                remove_bu1_count(d2, x)
-                                add_bu1_count(d2, y)
+                            remove_bu_count(d2, r2, x)
+                            add_bu_count(d2, r2, y)
 
                             if can_bu(d, desired_role, x):
                                 schedule[d_iso][desired_role] = x
                                 total_hours[x] += 8
-                                if desired_role == "BU1":
-                                    add_bu1_count(d, x)
+                                add_bu_count(d, desired_role, x)
                                 normalize_bu1_skip(d)
                                 post_unique = len(set(schedule[d_iso].values()))
                                 if post_unique > pre_unique:
@@ -1621,9 +1666,8 @@ def build_schedule(config: BuildConfig,
                             schedule[d2_iso][r2] = x
                             total_hours[x] += 8
                             total_hours[y] -= 8
-                            if r2 == "BU1":
-                                remove_bu1_count(d2, y)
-                                add_bu1_count(d2, x)
+                            remove_bu_count(d2, r2, y)
+                            add_bu_count(d2, r2, x)
 
                         if fixed:
                             break
@@ -1769,18 +1813,20 @@ def bu_deficit_metrics(
     schedule: Dict[str, Dict[str, str]],
     year: int,
     month: int,
+    roster_size: int,
 ) -> Dict[str, int]:
     total_bu_missing = 0
     bu2_bu3_missing = 0
     bu3_missing = 0
+    tracked_roles = {"BU2", "BU4"} if roster_size <= 5 else {"BU2", "BU3"}
 
     for d in month_days(year, month):
         day_roles = schedule.get(d.isoformat(), {})
-        for role in ideal_bu_roles_for_day(d):
+        for role in ideal_bu_roles_for_day(d, roster_size):
             assigned = day_roles.get(role, "")
             if not str(assigned).strip():
                 total_bu_missing += 1
-                if role in {"BU2", "BU3"}:
+                if role in tracked_roles:
                     bu2_bu3_missing += 1
                 if role == "BU3":
                     bu3_missing += 1
@@ -2137,8 +2183,8 @@ def export_to_excel(schedule, year, month, out_path, roster, hols, prev_sched,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--month", required=True)
-    ap.add_argument("--timeoff-xlsx", required=True)
-    ap.add_argument("--timeoff-sheet", required=True)
+    ap.add_argument("--timeoff-xlsx", default="FSA Schedule Info.xlsx")
+    ap.add_argument("--timeoff-sheet", default="FSA Schedule Info")
     ap.add_argument("--prev-schedule", required=True)
     ap.add_argument("--sales-sheet", default="Sales Ranking")
     ap.add_argument("--roster-sheet", default="Roster")
@@ -2166,6 +2212,10 @@ def main():
     args = ap.parse_args()
 
     year, month = parse_month_arg(args.month)
+    target_weekday_staff_overridden = any(
+        a == "--target-weekday-staff" or a.startswith("--target-weekday-staff=")
+        for a in sys.argv[1:]
+    )
     if args.roster_json:
         roster = load_roster_from_json(args.roster_json)
     else:
@@ -2177,7 +2227,25 @@ def main():
         )
         if roster is None:
             roster = DEFAULT_ROSTER[:]
-    timeoff = load_timeoff_from_xlsx(args.timeoff_xlsx, args.timeoff_sheet)
+    if not target_weekday_staff_overridden:
+        args.target_weekday_staff = min(5, max(4, len(roster) - 1))
+
+    wb_for_sheet = openpyxl.load_workbook(args.timeoff_xlsx, data_only=True)
+    try:
+        month_sheet = f"{calendar.month_name[month]} Requests"
+        if args.timeoff_sheet in wb_for_sheet.sheetnames:
+            resolved_timeoff_sheet = args.timeoff_sheet
+        elif month_sheet in wb_for_sheet.sheetnames:
+            resolved_timeoff_sheet = month_sheet
+        else:
+            raise ValueError(
+                f"Missing timeoff sheet names: '{args.timeoff_sheet}' and '{month_sheet}'. "
+                "Expected the default sheet or month request sheet pattern '<Month> Requests' (e.g., 'March Requests')."
+            )
+    finally:
+        wb_for_sheet.close()
+
+    timeoff = load_timeoff_from_xlsx(args.timeoff_xlsx, resolved_timeoff_sheet)
     cons = compile_constraints(timeoff)
     sales = load_sales_ranking_from_timeoff_xlsx(args.timeoff_xlsx, args.sales_sheet, year, month, roster)
     prev = load_schedule_json(args.prev_schedule)
@@ -2326,7 +2394,7 @@ def main():
                 winning_metrics = metrics
                 break
 
-            bu_metrics = bu_deficit_metrics(candidate, year, month)
+            bu_metrics = bu_deficit_metrics(candidate, year, month, len(roster))
             wk_over40 = weekly_over40_events(candidate, prev, roster, year, month)
             pp_over80 = payperiod_over80_events(candidate, prev, roster, pps, year, month)
 
