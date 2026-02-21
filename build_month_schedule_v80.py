@@ -623,8 +623,9 @@ def load_sales_ranking_from_timeoff_xlsx(xlsx_path, sheet_name, year, month, ros
             return [n for n in SENIORITY_ORDER if n in roster_set] + [n for n in roster_names if n not in SENIORITY_ORDER]
 
         order = [x for x in order if x in roster_set]
-        missing = roster_set - set(order)
-        order.extend(sorted(list(missing)))
+        for p in roster_names:
+            if p in roster_set and p not in order:
+                order.append(p)
         return order
     finally:
         wb.close()
@@ -875,12 +876,28 @@ def build_schedule(config: BuildConfig,
         return before, after
 
 
+    week_hours_cache: Dict[Tuple[str, date], int] = {}
+    pp_hours_cache: Dict[Tuple[str, date], int] = {}
+
+    def invalidate_hours_caches(person: str, d: date) -> None:
+        ws = week_start_sun(d)
+        week_hours_cache.pop((person, ws), None)
+        if payperiods:
+            pp = find_pp(d)
+            if pp:
+                s, _ = pp
+                pp_hours_cache.pop((person, s), None)
+
     def week_hours(name, d):
         ws = week_start_sun(d)
+        key = (name, ws)
+        if key in week_hours_cache:
+            return week_hours_cache[key]
         tot = 0
         for i in range(7):
             dd = ws + timedelta(days=i)
             tot += calculate_daily_hours(dd, name, schedule, prev_sched, year, month)
+        week_hours_cache[key] = tot
         return tot
 
     def find_pp(d):
@@ -893,11 +910,15 @@ def build_schedule(config: BuildConfig,
         pp = find_pp(d)
         if not pp: return 0
         s, e = pp
+        key = (name, s)
+        if key in pp_hours_cache:
+            return pp_hours_cache[key]
         tot = 0
         cur = s
         while cur <= e:
             tot += calculate_daily_hours(cur, name, schedule, prev_sched, year, month)
             cur += timedelta(days=1)
+        pp_hours_cache[key] = tot
         return tot
 
     def no_consecutive_saturday_ok(name: str, d: date) -> bool:
@@ -1127,6 +1148,7 @@ def build_schedule(config: BuildConfig,
                     schedule[sd.isoformat()]['PN'] = who
                     role_counts['PN'][who] += 1
                     total_hours[who] += 5
+                    invalidate_hours_caches(who, sd)
                     pn_weekday_counts[who][0] += 1
                     month_sunday_count[who] += 1
                     assigned_sunday = True
@@ -1142,6 +1164,7 @@ def build_schedule(config: BuildConfig,
                             schedule[sat.isoformat()]['AN'] = who
                             role_counts['AN'][who] += 1
                             total_hours[who] += 8
+                            invalidate_hours_caches(who, sat)
                     break
                 if assigned_sunday:
                     break
@@ -1189,6 +1212,7 @@ def build_schedule(config: BuildConfig,
                 role_counts[role][p] += 1
                 hrs = hours_for_role(d, role, hols)
                 total_hours[p] += hrs
+                invalidate_hours_caches(p, d)
                 if role == "PN":
                     wd = weekday_sun0(d)
                     pn_weekday_counts[p][wd] += 1
@@ -1199,6 +1223,7 @@ def build_schedule(config: BuildConfig,
                 del schedule[d.isoformat()][role]
                 role_counts[role][p] -= 1
                 total_hours[p] -= hrs
+                invalidate_hours_caches(p, d)
                 if role == "PN":
                     wd = weekday_sun0(d)
                     pn_weekday_counts[p][wd] -= 1
@@ -1298,6 +1323,8 @@ def build_schedule(config: BuildConfig,
                         hrs = hours_for_role(d, "PN", hols)
                         total_hours[hi] -= hrs
                         total_hours[lo] += hrs
+                        invalidate_hours_caches(hi, d)
+                        invalidate_hours_caches(lo, d)
                         wd = weekday_sun0(d)
                         pn_weekday_counts[hi][wd] -= 1
                         pn_weekday_counts[lo][wd] += 1
@@ -1352,6 +1379,10 @@ def build_schedule(config: BuildConfig,
                     schedule[sat_b_iso].pop("AN", None)
                     schedule[sun_a_iso].pop("PN", None)
                     schedule[sun_b_iso].pop("PN", None)
+                    invalidate_hours_caches(person_a, sat_a)
+                    invalidate_hours_caches(person_a, sun_a)
+                    invalidate_hours_caches(person_b, sat_b)
+                    invalidate_hours_caches(person_b, sun_b)
 
                     feasible = (
                         no_consecutive_saturday_ok(person_b, sat_a)
@@ -1367,6 +1398,10 @@ def build_schedule(config: BuildConfig,
                         schedule[sun_a_iso]["PN"] = person_b
                         schedule[sat_b_iso]["AN"] = person_a
                         schedule[sun_b_iso]["PN"] = person_a
+                        invalidate_hours_caches(person_b, sat_a)
+                        invalidate_hours_caches(person_b, sun_a)
+                        invalidate_hours_caches(person_a, sat_b)
+                        invalidate_hours_caches(person_a, sun_b)
                         recompute_primary_counters_from_schedule()
 
                         moves += 1
@@ -1374,12 +1409,16 @@ def build_schedule(config: BuildConfig,
                     else:
                         if orig_sat_a_an:
                             schedule[sat_a_iso]["AN"] = orig_sat_a_an
+                            invalidate_hours_caches(orig_sat_a_an, sat_a)
                         if orig_sun_a_pn:
                             schedule[sun_a_iso]["PN"] = orig_sun_a_pn
+                            invalidate_hours_caches(orig_sun_a_pn, sun_a)
                         if orig_sat_b_an:
                             schedule[sat_b_iso]["AN"] = orig_sat_b_an
+                            invalidate_hours_caches(orig_sat_b_an, sat_b)
                         if orig_sun_b_pn:
                             schedule[sun_b_iso]["PN"] = orig_sun_b_pn
+                            invalidate_hours_caches(orig_sun_b_pn, sun_b)
 
                     if moved:
                         break
@@ -1415,6 +1454,8 @@ def build_schedule(config: BuildConfig,
                                 add_bu_count(d, role, lo)
                                 total_hours[hi] -= 8
                                 total_hours[lo] += 8
+                                invalidate_hours_caches(hi, d)
+                                invalidate_hours_caches(lo, d)
                                 moves += 1
                                 moved = True
                                 break
@@ -1554,6 +1595,7 @@ def build_schedule(config: BuildConfig,
             schedule[d.isoformat()][role] = p
             total_hours[p] += 8
             add_bu_count(d, role, p)
+            invalidate_hours_caches(p, d)
 
             if solve_bu(idx + 1):
                 return True
@@ -1561,6 +1603,7 @@ def build_schedule(config: BuildConfig,
             del schedule[d.isoformat()][role]
             total_hours[p] -= 8
             remove_bu_count(d, role, p)
+            invalidate_hours_caches(p, d)
 
         return False
 
@@ -1572,6 +1615,8 @@ def build_schedule(config: BuildConfig,
             for d_iso2 in list(schedule.keys()):
                 for k in ['BU1','BU2','BU3','BU4']:
                     schedule[d_iso2].pop(k, None)
+            week_hours_cache.clear()
+            pp_hours_cache.clear()
             for role_name in bu_counts:
                 for p2 in bu_counts[role_name]:
                     bu_counts[role_name][p2] = 0
@@ -1604,17 +1649,27 @@ def build_schedule(config: BuildConfig,
                 schedule[d_iso][role] = pick
                 total_hours[pick] += 8
                 add_bu_count(d, role, pick)
+                invalidate_hours_caches(pick, d)
             # --- end greedy fallback ---
 
     # --- BU REPAIR PASS ---
     bu_repair_swaps = []
     repair_roles = {"BU2", "BU3"}
+    def next_missing_repair_role(d: date) -> Optional[str]:
+        expected = ideal_bu_roles_for_day(d, roster_size)
+        d_iso = d.isoformat()
+        for role in ("BU1", "BU2", "BU3", "BU4"):
+            if role in expected and role not in schedule[d_iso]:
+                if role in repair_roles:
+                    return role
+                return None
+        return None
+
     deficits = []
     for d in days:
-        expected = ideal_bu_roles_for_day(d, roster_size)
-        for role in expected:
-            if role in repair_roles and role not in schedule[d.isoformat()]:
-                deficits.append((d, role))
+        role = next_missing_repair_role(d)
+        if role is not None:
+            deficits.append((d, role))
     before_deficits = len(deficits)
 
     for d, role in deficits:
@@ -1633,6 +1688,7 @@ def build_schedule(config: BuildConfig,
             schedule[d_iso][role] = pick
             total_hours[pick] += 8
             add_bu_count(d, role, pick)
+            invalidate_hours_caches(pick, d)
             bu_repair_swaps.append({
                 "type": "direct",
                 "deficit_day": d_iso,
@@ -1693,6 +1749,8 @@ def build_schedule(config: BuildConfig,
                     schedule[d2_iso][moved_role] = q
                     total_hours[p] -= 8
                     total_hours[q] += 8
+                    invalidate_hours_caches(p, d2)
+                    invalidate_hours_caches(q, d2)
                     remove_bu_count(d2, moved_role, p)
                     add_bu_count(d2, moved_role, q)
 
@@ -1701,6 +1759,7 @@ def build_schedule(config: BuildConfig,
                         schedule[d_iso][role] = p
                         total_hours[p] += 8
                         add_bu_count(d, role, p)
+                        invalidate_hours_caches(p, d)
                         bu_repair_swaps.append({
                             "type": "swap",
                             "deficit_day": d_iso,
@@ -1718,6 +1777,8 @@ def build_schedule(config: BuildConfig,
                     schedule[d2_iso][moved_role] = p
                     total_hours[p] += 8
                     total_hours[q] -= 8
+                    invalidate_hours_caches(p, d2)
+                    invalidate_hours_caches(q, d2)
                     remove_bu_count(d2, moved_role, q)
                     add_bu_count(d2, moved_role, p)
 
@@ -1728,10 +1789,9 @@ def build_schedule(config: BuildConfig,
 
     remaining_deficits = []
     for d in days:
-        expected = ideal_bu_roles_for_day(d, roster_size)
-        for role in expected:
-            if role in repair_roles and role not in schedule[d.isoformat()]:
-                remaining_deficits.append((d, role))
+        role = next_missing_repair_role(d)
+        if role is not None:
+            remaining_deficits.append((d, role))
     after_deficits = len(remaining_deficits)
     print("\n--- BU Repair Pass Summary ---")
     print(f"{sorted(repair_roles)} deficits before repair: {before_deficits}")
@@ -1810,6 +1870,7 @@ def build_schedule(config: BuildConfig,
                 del schedule[d_iso]["BU2"]
                 remove_bu_count(d, "BU2", p)
                 add_bu_count(d, "BU1", p)
+                invalidate_hours_caches(p, d)
 
         def add_bu1_count(d: date, person: str):
             add_bu_count(d, "BU1", person)
@@ -1842,6 +1903,7 @@ def build_schedule(config: BuildConfig,
                 del schedule[day_iso][role]
                 role_counts[role][person] -= 1
                 total_hours[person] -= hours_for_role(day, role, hols)
+                invalidate_hours_caches(person, day)
                 if role == "PN":
                     pn_weekday_counts[person][weekday_sun0(day)] -= 1
                     if weekday_sun0(day) == 1:
@@ -1852,6 +1914,7 @@ def build_schedule(config: BuildConfig,
                 schedule[day_iso][role] = person
                 role_counts[role][person] += 1
                 total_hours[person] += hours_for_role(day, role, hols)
+                invalidate_hours_caches(person, day)
                 if role == "PN":
                     pn_weekday_counts[person][weekday_sun0(day)] += 1
                     if weekday_sun0(day) == 1:
@@ -1910,6 +1973,7 @@ def build_schedule(config: BuildConfig,
                                 schedule[d_iso][desired_bu_role] = p
                                 total_hours[p] += 8
                                 add_bu_count(d, desired_bu_role, p)
+                                invalidate_hours_caches(p, d)
                                 normalize_bu1_skip(d)
                                 moves_performed += 3
                                 if verbose:
@@ -1977,6 +2041,7 @@ def build_schedule(config: BuildConfig,
                     schedule[d_iso][desired_role] = pick
                     total_hours[pick] += 8
                     add_bu_count(d, desired_role, pick)
+                    invalidate_hours_caches(pick, d)
                     normalize_bu1_skip(d)
                     post_unique = unique_assignee_count(schedule[d_iso])
                     if post_unique > pre_unique:
@@ -2032,6 +2097,8 @@ def build_schedule(config: BuildConfig,
                             schedule[d2_iso][r2] = y
                             total_hours[x] -= 8
                             total_hours[y] += 8
+                            invalidate_hours_caches(x, d2)
+                            invalidate_hours_caches(y, d2)
                             remove_bu_count(d2, r2, x)
                             add_bu_count(d2, r2, y)
 
@@ -2039,6 +2106,7 @@ def build_schedule(config: BuildConfig,
                                 schedule[d_iso][desired_role] = x
                                 total_hours[x] += 8
                                 add_bu_count(d, desired_role, x)
+                                invalidate_hours_caches(x, d)
                                 normalize_bu1_skip(d)
                                 post_unique = unique_assignee_count(schedule[d_iso])
                                 if post_unique > pre_unique:
@@ -2056,6 +2124,8 @@ def build_schedule(config: BuildConfig,
                             schedule[d2_iso][r2] = x
                             total_hours[x] += 8
                             total_hours[y] -= 8
+                            invalidate_hours_caches(x, d2)
+                            invalidate_hours_caches(y, d2)
                             remove_bu_count(d2, r2, y)
                             add_bu_count(d2, r2, x)
 
@@ -2156,6 +2226,8 @@ def build_schedule(config: BuildConfig,
                             add_bu_count(d, "BU1", lo)
                             total_hours[hi] -= 8
                             total_hours[lo] += 8
+                            invalidate_hours_caches(hi, d)
+                            invalidate_hours_caches(lo, d)
 
                             bu1_swaps += 1
                             moved = True
