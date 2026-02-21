@@ -2548,6 +2548,8 @@ def write_violations_tab(wb, schedule, year, month, roster, targets, cons, prev_
         hard_off_names = cons.hard_off.get(d, set())
         
         for r, p in rmap.items():
+            if p is None or str(p).strip() == "":
+                continue
             roles_by_person.setdefault(p, []).append(r)
 
             # B. Hard Off
@@ -2813,14 +2815,35 @@ def main():
     args = ap.parse_args()
 
     stop_event = threading.Event()
+    hb_thread = None
+    enable_heartbeat = False
+    if args.auto_seed:
+        seed_start_hb = args.seed_start
+        seed_end_hb = args.seed_end
+        seed_end_overridden_hb = any(
+            a == "--seed-end" or a.startswith("--seed-end=")
+            for a in sys.argv[1:]
+        )
+        max_attempts_overridden_hb = any(
+            a == "--max-attempts" or a.startswith("--max-attempts=")
+            for a in sys.argv[1:]
+        )
+        if max_attempts_overridden_hb:
+            if not seed_end_overridden_hb:
+                seed_end_hb = seed_start_hb + args.max_attempts - 1
+            else:
+                seed_end_hb = min(seed_end_hb, seed_start_hb + args.max_attempts - 1)
+        resolved_seed_range_size = max(0, seed_end_hb - seed_start_hb + 1)
+        enable_heartbeat = args.auto_seed or resolved_seed_range_size >= 25
 
-    def heartbeat() -> None:
-        while not stop_event.is_set():
-            print('.', end='', file=sys.stderr, flush=True)
-            stop_event.wait(3.0)
+    if enable_heartbeat:
+        def heartbeat() -> None:
+            while not stop_event.is_set():
+                print('.', end='', file=sys.stderr, flush=True)
+                stop_event.wait(3.0)
 
-    hb_thread = threading.Thread(target=heartbeat, daemon=True)
-    hb_thread.start()
+        hb_thread = threading.Thread(target=heartbeat, daemon=True)
+        hb_thread.start()
 
     try:
         year, month = parse_month_arg(args.month)
@@ -2851,18 +2874,17 @@ def main():
         if not min_weekday_staff_overridden:
             args.min_weekday_staff = default_min_weekday_staff(len(roster))
 
+        weekday_repair_explicit = any(a == "--weekday-target-repair" for a in sys.argv[1:])
         if args.auto_seed:
             enforce_target = True
             if args.no_enforce_target_when_available:
                 enforce_target = False
-            if args.enforce_target_when_available:
+            elif args.enforce_target_when_available:
                 enforce_target = True
-        else:
-            enforce_target = args.enforce_target_when_available
+            # else: keep default True
 
-        weekday_repair_explicit = any(a == "--weekday-target-repair" for a in sys.argv[1:])
-        if args.auto_seed and enforce_target and (not weekday_repair_explicit) and (not args.no_weekday_target_repair):
-            args.weekday_target_repair = True
+            if enforce_target and (not weekday_repair_explicit) and (not args.no_weekday_target_repair):
+                args.weekday_target_repair = True
 
         wb_for_sheet = openpyxl.load_workbook(args.timeoff_xlsx, data_only=True)
         try:
@@ -3171,8 +3193,9 @@ def main():
         print(f"✅ Excel: {ox}")
     finally:
         stop_event.set()
-        hb_thread.join(timeout=1.0)
-        print('', file=sys.stderr)
+        if hb_thread is not None:
+            hb_thread.join(timeout=1.0)
+            print('', file=sys.stderr)
 
 
 if __name__ == "__main__":
