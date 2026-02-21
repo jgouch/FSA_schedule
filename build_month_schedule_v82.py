@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v82.py
+build_month_schedule_v83.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -22,7 +22,8 @@ LOCKED CALENDAR GEOMETRY:
     BU3 name: (mid, R+6)
     BU4 name (push-week Saturday only): (mid, R+7)
 
-Logic Changes (v82):
+Logic Changes (v83):
+- FIX (v83): Graceful template fallback now includes Day of Week headers; filter out ghost employees in constraints; remove cache destruction in auto-seed loop.
 - FIX (v82): Graceful fallback to draw the calendar grid from scratch if no template is provided.
 - FIX (v80): Repair BU1 delta balancing (can_bu ordering + cap bypass), correct Saturday fairness swap accounting.
 - FIX (v79): Add Saturday fairness balancing pass to evenly distribute Saturday work across the team.
@@ -343,10 +344,15 @@ class Constraints:
     hard_off: Dict[date, Set[str]]
     avoid_roles: Dict[Tuple[date, str], Set[str]]
 
-def compile_constraints(timeoff: List[TimeOffRule]) -> Constraints:
+def compile_constraints(timeoff: List[TimeOffRule], roster: List[str]) -> Constraints:
     hard_off: Dict[date, Set[str]] = {}
     avoid_roles: Dict[Tuple[date, str], Set[str]] = {}
+    roster_set = set(roster)
+
     for r in timeoff:
+        if r.name not in roster_set:
+            continue  # Ignore requests from inactive/former employees
+
         if r.hard:
             hard_off.setdefault(r.d, set()).add(r.name)
         if r.avoid_roles:
@@ -2613,6 +2619,16 @@ def export_to_excel(schedule, year, month, out_path, roster, hols, prev_sched,
         c.font = FONT_HEADER
         c.alignment = ALIGN_CENTER
 
+        # Draw Days of the Week headers
+        days_of_week = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        for i, day_name in enumerate(days_of_week):
+            col = SUN_START_COL + (i * DAY_WIDTH)
+            ws.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col + DAY_WIDTH - 1)
+            c = ws.cell(2, col, day_name)
+            c.font = Font(name="Calibri", size=14, bold=True)
+            c.alignment = ALIGN_CENTER
+            c.border = THIN_BORDER
+
     ws.title = _cal.month_name[month]
     ws.sheet_view.showGridLines = False
 
@@ -2849,7 +2865,7 @@ def main():
             wb_for_sheet.close()
 
         timeoff = load_timeoff_from_xlsx(args.timeoff_xlsx, resolved_timeoff_sheet)
-        cons = compile_constraints(timeoff)
+        cons = compile_constraints(timeoff, roster)
         sales = load_sales_ranking_from_timeoff_xlsx(args.timeoff_xlsx, args.sales_sheet, year, month, roster)
         prev = load_schedule_json(args.prev_schedule)
         if args.payperiods_json:
@@ -2938,9 +2954,6 @@ def main():
 
             for seed in range(seed_start, seed_end + 1):
                 perfect_found = False
-                _week_push_cache.clear()
-                _week_hol_cache.clear()
-                _push_days_cache.clear()
                 cfg = BuildConfig(
                     year,
                     month,
@@ -3152,4 +3165,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
