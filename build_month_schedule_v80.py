@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v79.py
+build_month_schedule_v80.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -61,10 +61,11 @@ Logic Changes (v34):
 - FIX (v77): Enforce 4-unique weekday staffing when available_count >= 4 (only relax when <4); prioritize constrained days first; add progress heartbeat dot every 3 seconds.
 - FIX (v78): BU1 fairness now continues from primary remainder pointer (W->BU1 carryover) and enforces combined (PN+AN+W+BU1) spread <= 1 when feasible.
 - FIX (v79): Add Saturday fairness balancing pass to evenly distribute Saturday work (any role on Saturday) across the team; includes validator + auto-seed scoring support.
+- FIX (v80): Repair BU1 delta balancing (can_bu ordering + cap bypass), correct Saturday fairness swap accounting, include push-Saturday BU in Saturday fairness, harden distribute_with_cursor + saturday counts, and optimize BU1 scoring.
 """
 
 # Compile sanity check (warnings enabled):
-#   python3 -Wall -m py_compile build_month_schedule_v78.py
+#   python3 -Wall -m py_compile build_month_schedule_v80.py
 
 from __future__ import annotations
 
@@ -247,6 +248,10 @@ def _rotate_left(lst: List[str], k: int) -> List[str]:
 def distribute_with_cursor(order: List[str], total: int, n: int, cursor: int) -> Tuple[Dict[str, int], int]:
     if n <= 0:
         raise ValueError("n must be positive in distribute_with_cursor")
+    if len(order) != n:
+        raise ValueError(f"distribute_with_cursor: len(order)!=n (len(order)={len(order)}, n={n})")
+    if len(set(order)) != n:
+        raise ValueError("distribute_with_cursor: duplicate names in order")
     base = total // n
     rem = total % n
     targets = {p: base for p in order}
@@ -276,8 +281,9 @@ def saturday_work_counts(
     year: int,
     month: int,
     hols: Set[date],
+    roster: Optional[List[str]] = None,
 ) -> Dict[str, int]:
-    people: Set[str] = set()
+    people: Set[str] = set(roster or [])
     for rmap in schedule.values():
         people.update(unique_assignees(rmap.values()))
 
@@ -1218,10 +1224,41 @@ def build_schedule(config: BuildConfig,
         moves = 0
 
         def counts_with_roster() -> Dict[str, int]:
-            counts = saturday_work_counts(schedule, year, month, hols)
-            for p in config.roster:
-                counts.setdefault(p, 0)
-            return counts
+            return saturday_work_counts(schedule, year, month, hols, config.roster)
+
+        def recompute_primary_counters_from_schedule() -> None:
+            for role_name in ("PN", "AN", "W"):
+                for person in config.roster:
+                    role_counts[role_name][person] = 0
+            for person in config.roster:
+                for wd in range(7):
+                    pn_weekday_counts[person][wd] = 0
+                monday_pn_used[person] = 0
+                total_hours[person] = 0
+
+            for dd in days:
+                d_iso = dd.isoformat()
+                day_roles = schedule.get(d_iso, {})
+                for role_name in ("PN", "AN", "W"):
+                    person = day_roles.get(role_name)
+                    if not person:
+                        continue
+                    role_counts[role_name][person] += 1
+                    hrs = hours_for_role(dd, role_name, hols)
+                    total_hours[person] += hrs
+                    if role_name == "PN":
+                        wd = weekday_sun0(dd)
+                        pn_weekday_counts[person][wd] += 1
+                        if wd == 1:
+                            monday_pn_used[person] += 1
+
+            try:
+                tracked_bu_counts = bu_counts
+            except NameError:
+                tracked_bu_counts = {}
+            for role_name in tracked_bu_counts:
+                for person in config.roster:
+                    total_hours[person] += tracked_bu_counts[role_name][person] * 8
 
         while True:
             counts = counts_with_roster()
@@ -1306,6 +1343,11 @@ def build_schedule(config: BuildConfig,
                     sat_a_iso, sun_a_iso = sat_a.isoformat(), sun_a.isoformat()
                     sat_b_iso, sun_b_iso = sat_b.isoformat(), sun_b.isoformat()
 
+                    orig_sat_a_an = schedule[sat_a_iso].get("AN")
+                    orig_sun_a_pn = schedule[sun_a_iso].get("PN")
+                    orig_sat_b_an = schedule[sat_b_iso].get("AN")
+                    orig_sun_b_pn = schedule[sun_b_iso].get("PN")
+
                     schedule[sat_a_iso].pop("AN", None)
                     schedule[sat_b_iso].pop("AN", None)
                     schedule[sun_a_iso].pop("PN", None)
@@ -1325,42 +1367,63 @@ def build_schedule(config: BuildConfig,
                         schedule[sun_a_iso]["PN"] = person_b
                         schedule[sat_b_iso]["AN"] = person_a
                         schedule[sun_b_iso]["PN"] = person_a
-
-                        role_counts["AN"][person_a] -= 1
-                        role_counts["AN"][person_b] += 1
-                        role_counts["AN"][person_b] -= 1
-                        role_counts["AN"][person_a] += 1
-                        role_counts["PN"][person_a] -= 1
-                        role_counts["PN"][person_b] += 1
-                        role_counts["PN"][person_b] -= 1
-                        role_counts["PN"][person_a] += 1
-
-                        total_hours[person_a] -= 8
-                        total_hours[person_b] += 8
-                        total_hours[person_b] -= 8
-                        total_hours[person_a] += 8
-                        total_hours[person_a] -= 5
-                        total_hours[person_b] += 5
-                        total_hours[person_b] -= 5
-                        total_hours[person_a] += 5
-
-                        pn_weekday_counts[person_a][0] -= 1
-                        pn_weekday_counts[person_b][0] += 1
-                        pn_weekday_counts[person_b][0] -= 1
-                        pn_weekday_counts[person_a][0] += 1
+                        recompute_primary_counters_from_schedule()
 
                         moves += 1
                         moved = True
                     else:
-                        schedule[sat_a_iso]["AN"] = person_a
-                        schedule[sun_a_iso]["PN"] = person_a
-                        schedule[sat_b_iso]["AN"] = person_b
-                        schedule[sun_b_iso]["PN"] = person_b
+                        if orig_sat_a_an:
+                            schedule[sat_a_iso]["AN"] = orig_sat_a_an
+                        if orig_sun_a_pn:
+                            schedule[sun_a_iso]["PN"] = orig_sun_a_pn
+                        if orig_sat_b_an:
+                            schedule[sat_b_iso]["AN"] = orig_sat_b_an
+                        if orig_sun_b_pn:
+                            schedule[sun_b_iso]["PN"] = orig_sun_b_pn
 
                     if moved:
                         break
                 if moved:
                     break
+
+            if moved:
+                continue
+
+            if stage_label == "post-bu":
+                push_days = get_push_days_for_month(year, month)
+                for hi in hi_people:
+                    for d in days:
+                        if not is_saturday(d) or d in hols or d not in push_days:
+                            continue
+                        d_iso = d.isoformat()
+                        for role in ("BU1", "BU2", "BU3", "BU4"):
+                            if schedule[d_iso].get(role) != hi:
+                                continue
+                            for lo in lo_people:
+                                if lo == hi:
+                                    continue
+                                if lo in schedule[d_iso].values():
+                                    continue
+                                if lo in cons.hard_off.get(d, set()):
+                                    continue
+                                if not no_consecutive_saturday_ok(lo, d):
+                                    continue
+                                if not can_bu(d, role, lo):
+                                    continue
+                                schedule[d_iso][role] = lo
+                                remove_bu_count(d, role, hi)
+                                add_bu_count(d, role, lo)
+                                total_hours[hi] -= 8
+                                total_hours[lo] += 8
+                                moves += 1
+                                moved = True
+                                break
+                            if moved:
+                                break
+                        if moved:
+                            break
+                    if moved:
+                        break
 
             if not moved:
                 final_spread = saturday_spread(counts_with_roster())
@@ -1444,7 +1507,7 @@ def build_schedule(config: BuildConfig,
         BU_ROLE_RANK.get(item[1], 99),
     ))
 
-    def bu_score(d, role, p):
+    def bu_score(d, role, p, min_combined: Optional[int] = None):
         s = rng.random()
         s -= total_hours[p] * 0.5
         s -= pp_hours(p, d) * 1.0
@@ -1453,11 +1516,13 @@ def build_schedule(config: BuildConfig,
             s += (bu_targets[role][p] - bu_counts[role][p]) * deficit_weight
             s -= bu_weekday_counts[role][p][weekday_sun0(d)] * 10.0
         if role == 'BU1':
-            combined = {person: combined_total_for(person) for person in config.roster}
-            min_combined = min(combined.values())
-            s -= (combined[p] - min_combined) * 45.0
-            if combined[p] > min_combined + 1:
-                s -= 500.0 + (combined[p] - (min_combined + 1)) * 200.0
+            person_combined = combined_total_for(p)
+            effective_min_combined = min_combined
+            if effective_min_combined is None:
+                effective_min_combined = min(combined_total_for(person) for person in config.roster)
+            s -= (person_combined - effective_min_combined) * 45.0
+            if person_combined > effective_min_combined + 1:
+                s -= 500.0 + (person_combined - (effective_min_combined + 1)) * 200.0
             # extra spread on Mondays (avoid the same BU1 on Mondays)
             if weekday_sun0(d) == 1:
                 s -= bu_weekday_counts['BU1'][p][1] * 25.0
@@ -1480,7 +1545,10 @@ def build_schedule(config: BuildConfig,
         d, role = bu_queue[idx]
         cands = [p for p in config.roster if can_bu(d, role, p)]
         rng.shuffle(cands)
-        cands.sort(key=lambda p: bu_score(d, role, p), reverse=True)
+        min_combined = None
+        if role == "BU1":
+            min_combined = min(combined_total_for(person) for person in config.roster)
+        cands.sort(key=lambda p: bu_score(d, role, p, min_combined=min_combined), reverse=True)
         
         for p in cands:
             schedule[d.isoformat()][role] = p
@@ -1528,7 +1596,10 @@ def build_schedule(config: BuildConfig,
                 cands = [person for person in config.roster if can_bu(d, role, person)]
                 if not cands:
                     continue
-                cands.sort(key=lambda person: bu_score(d, role, person), reverse=True)
+                min_combined = None
+                if role == "BU1":
+                    min_combined = min(combined_total_for(person) for person in config.roster)
+                cands.sort(key=lambda person: bu_score(d, role, person, min_combined=min_combined), reverse=True)
                 pick = cands[0]
                 schedule[d_iso][role] = pick
                 total_hours[pick] += 8
@@ -2047,56 +2118,60 @@ def build_schedule(config: BuildConfig,
                 print(f"[weekday-target-repair] {action}")
 
     def balance_bu1_delta_pass() -> Tuple[int, int]:
+        nonlocal enforce_bu1_cap
         bu1_swaps = 0
 
         def combined_counts() -> Dict[str, int]:
             return {p: primary_counts_total[p] + bu_counts.get("BU1", {}).get(p, 0) for p in config.roster}
 
-        while True:
-            combined = combined_counts()
-            min_v = min(combined.values())
-            max_v = max(combined.values())
-            if max_v - min_v <= 1:
-                return bu1_swaps, max_v - min_v
+        prev_enforce = enforce_bu1_cap
+        enforce_bu1_cap = False
+        try:
+            while True:
+                combined = combined_counts()
+                min_v = min(combined.values())
+                max_v = max(combined.values())
+                if max_v - min_v <= 1:
+                    final_spread = max_v - min_v
+                    print(f"BU1 balance: swaps={bu1_swaps}, final combined spread={final_spread}")
+                    return bu1_swaps, final_spread
 
-            hi_people = [p for p in config.roster if combined[p] == max_v]
-            lo_people = [p for p in config.roster if combined[p] == min_v]
-            moved = False
+                hi_people = [p for p in config.roster if combined[p] == max_v]
+                lo_people = [p for p in config.roster if combined[p] == min_v]
+                moved = False
 
-            for hi in hi_people:
-                for lo in lo_people:
-                    for d in days:
-                        if schedule[d.isoformat()].get("BU1") != hi:
-                            continue
-                        if lo in schedule[d.isoformat()].values():
-                            continue
+                for hi in hi_people:
+                    for lo in lo_people:
+                        for d in days:
+                            d_iso = d.isoformat()
+                            if schedule[d_iso].get("BU1") != hi:
+                                continue
+                            if lo in schedule[d_iso].values():
+                                continue
+                            if not can_bu(d, "BU1", lo):
+                                continue
 
-                        d_iso = d.isoformat()
-                        schedule[d_iso]["BU1"] = lo
-                        remove_bu_count(d, "BU1", hi)
-                        add_bu_count(d, "BU1", lo)
-                        total_hours[hi] -= 8
-                        total_hours[lo] += 8
+                            schedule[d_iso]["BU1"] = lo
+                            remove_bu_count(d, "BU1", hi)
+                            add_bu_count(d, "BU1", lo)
+                            total_hours[hi] -= 8
+                            total_hours[lo] += 8
 
-                        if not can_bu(d, "BU1", lo):
-                            schedule[d_iso]["BU1"] = hi
-                            remove_bu_count(d, "BU1", lo)
-                            add_bu_count(d, "BU1", hi)
-                            total_hours[hi] += 8
-                            total_hours[lo] -= 8
-                            continue
-
-                        bu1_swaps += 1
-                        moved = True
-                        break
+                            bu1_swaps += 1
+                            moved = True
+                            break
+                        if moved:
+                            break
                     if moved:
                         break
-                if moved:
-                    break
 
-            if not moved:
-                final_combined = combined_counts()
-                return bu1_swaps, max(final_combined.values()) - min(final_combined.values())
+                if not moved:
+                    final_combined = combined_counts()
+                    final_spread = max(final_combined.values()) - min(final_combined.values())
+                    print(f"BU1 balance: swaps={bu1_swaps}, final combined spread={final_spread}")
+                    return bu1_swaps, final_spread
+        finally:
+            enforce_bu1_cap = prev_enforce
 
     # ALWAYS enforce BU1 precedence after all BU work (regardless of repair flag).
     normalize_bu1_precedence_all_days()
@@ -2201,9 +2276,7 @@ def validate_saturday_spread(
     roster: List[str],
     max_spread: int = 1,
 ) -> Tuple[bool, str]:
-    counts = saturday_work_counts(schedule, year, month, hols)
-    for p in roster:
-        counts.setdefault(p, 0)
+    counts = saturday_work_counts(schedule, year, month, hols, roster)
     spread = saturday_spread(counts)
     msg = f"Saturday spread={spread}, counts={counts}"
     return spread <= max_spread, msg
@@ -2906,7 +2979,7 @@ def main():
                 bu_metrics = bu_deficit_metrics(candidate, year, month, len(roster))
                 wk_over40 = weekly_over40_events(candidate, prev, roster, year, month)
                 pp_over80 = payperiod_over80_events(candidate, prev, roster, pps, year, month)
-                sat_spread = saturday_spread(saturday_work_counts(candidate, year, month, hols))
+                sat_spread = saturday_spread(saturday_work_counts(candidate, year, month, hols, roster))
 
                 score = (
                     metrics["eligible_days_with_target_or_more"],
