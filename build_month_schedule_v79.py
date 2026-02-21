@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v78.py
+build_month_schedule_v79.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -60,6 +60,7 @@ Logic Changes (v34):
 - FIX (v76): Auto-seed auto-enables weekday-target-repair when enforcing target staffing and expands default seed sweep; adds tight-day diagnostics showing when BU1 is required to reach target.
 - FIX (v77): Enforce 4-unique weekday staffing when available_count >= 4 (only relax when <4); prioritize constrained days first; add progress heartbeat dot every 3 seconds.
 - FIX (v78): BU1 fairness now continues from primary remainder pointer (W->BU1 carryover) and enforces combined (PN+AN+W+BU1) spread <= 1 when feasible.
+- FIX (v79): Add Saturday fairness balancing pass to evenly distribute Saturday work (any role on Saturday) across the team; includes validator + auto-seed scoring support.
 """
 
 # Compile sanity check (warnings enabled):
@@ -268,6 +269,34 @@ def unique_assignees(values) -> Set[str]:
 
 def unique_assignee_count(role_map: Dict[str, str]) -> int:
     return len(unique_assignees(role_map.values()))
+
+
+def saturday_work_counts(
+    schedule: Dict[str, Dict[str, str]],
+    year: int,
+    month: int,
+    hols: Set[date],
+) -> Dict[str, int]:
+    people: Set[str] = set()
+    for rmap in schedule.values():
+        people.update(unique_assignees(rmap.values()))
+
+    counts = {person: 0 for person in people}
+    for d in month_days(year, month):
+        if not is_saturday(d) or d in hols:
+            continue
+        assigned = unique_assignees(schedule.get(d.isoformat(), {}).values())
+        for person in assigned:
+            counts.setdefault(person, 0)
+            counts[person] += 1
+    return counts
+
+
+def saturday_spread(counts: Dict[str, int]) -> int:
+    if not counts:
+        return 0
+    vals = list(counts.values())
+    return max(vals) - min(vals)
 
 # Global logic checks
 _week_push_cache: Dict[date, bool] = {}
@@ -865,6 +894,21 @@ def build_schedule(config: BuildConfig,
             cur += timedelta(days=1)
         return tot
 
+    def no_consecutive_saturday_ok(name: str, d: date) -> bool:
+        if not is_saturday(d):
+            return True
+        ws_sat = week_start_sun(d)
+        if week_contains_push(ws_sat) or week_contains_holiday(ws_sat):
+            return True
+        prev_sat = d - timedelta(days=7)
+        next_sat = d + timedelta(days=7)
+        if calculate_daily_hours(prev_sat, name, schedule, prev_sched, year, month) != 0:
+            return False
+        if next_sat.year == year and next_sat.month == month:
+            if calculate_daily_hours(next_sat, name, schedule, prev_sched, year, month) != 0:
+                return False
+        return True
+
     def can_assign_primary(d, role, name, strict_mode):
         if d in hols: return False
         if name in cons.hard_off.get(d, set()): return False
@@ -872,8 +916,7 @@ def build_schedule(config: BuildConfig,
         if name in schedule[d.isoformat()].values(): return False
         
         # No consecutive Saturdays (any role) — relaxed during push/holiday weeks
-        ws_sat = week_start_sun(d)
-        if is_saturday(d) and (not (week_contains_push(ws_sat) or week_contains_holiday(ws_sat))) and calculate_daily_hours(d - timedelta(days=7), name, schedule, prev_sched, year, month) != 0: return False
+        if not no_consecutive_saturday_ok(name, d): return False
         # B2B (Same Role) should mean previous CALENDAR day, not previous WORKED role
         prev_d = d - timedelta(days=1)
         prev_roles = schedule.get(prev_d.isoformat(), {})
@@ -978,8 +1021,7 @@ def build_schedule(config: BuildConfig,
         if p in schedule[d.isoformat()].values(): return False
         if role == 'BU1' and enforce_bu1_cap and bu_targets.get('BU1', {}).get(p, 0) > 0 and bu_counts['BU1'][p] >= bu_targets['BU1'][p]: return False
         # No consecutive Saturdays (any role) — relaxed during push/holiday weeks
-        ws_sat = week_start_sun(d)
-        if is_saturday(d) and (not (week_contains_push(ws_sat) or week_contains_holiday(ws_sat))) and calculate_daily_hours(d - timedelta(days=7), p, schedule, prev_sched, year, month) != 0: return False
+        if not no_consecutive_saturday_ok(p, d): return False
         # Push week relaxation: consecutive-days cap not enforced during push week
 
         ws = week_start_sun(d)
@@ -1171,6 +1213,161 @@ def build_schedule(config: BuildConfig,
             print(">> Relaxed solve successful.")
     else:
         print(">> Strict solve successful.")
+
+    def saturday_fairness_pass(stage_label: str) -> Tuple[int, int]:
+        moves = 0
+
+        def counts_with_roster() -> Dict[str, int]:
+            counts = saturday_work_counts(schedule, year, month, hols)
+            for p in config.roster:
+                counts.setdefault(p, 0)
+            return counts
+
+        while True:
+            counts = counts_with_roster()
+            spread = saturday_spread(counts)
+            if spread <= 1:
+                print(f"Saturday fairness ({stage_label}): moves={moves}, spread={spread}")
+                return moves, spread
+
+            max_c = max(counts.values())
+            min_c = min(counts.values())
+            hi_people = [p for p in config.roster if counts.get(p, 0) == max_c]
+            lo_people = [p for p in config.roster if counts.get(p, 0) == min_c]
+            moved = False
+
+            for hi in hi_people:
+                for d in days:
+                    d_iso = d.isoformat()
+                    if not is_saturday(d) or d in hols:
+                        continue
+                    if schedule[d_iso].get("PN") != hi:
+                        continue
+                    for lo in lo_people:
+                        if lo == hi:
+                            continue
+                        if lo in schedule[d_iso].values():
+                            continue
+                        if lo in cons.hard_off.get(d, set()):
+                            continue
+                        if not no_consecutive_saturday_ok(lo, d):
+                            continue
+                        if not can_assign_primary(d, "PN", lo, strict_mode=False):
+                            continue
+
+                        schedule[d_iso]["PN"] = lo
+                        role_counts["PN"][hi] -= 1
+                        role_counts["PN"][lo] += 1
+                        hrs = hours_for_role(d, "PN", hols)
+                        total_hours[hi] -= hrs
+                        total_hours[lo] += hrs
+                        wd = weekday_sun0(d)
+                        pn_weekday_counts[hi][wd] -= 1
+                        pn_weekday_counts[lo][wd] += 1
+                        if wd == 1:
+                            monday_pn_used[hi] -= 1
+                            monday_pn_used[lo] += 1
+                        moves += 1
+                        moved = True
+                        break
+                    if moved:
+                        break
+                if moved:
+                    break
+
+            if moved:
+                continue
+
+            weekend_pairs: List[Tuple[date, str]] = []
+            for sat in days:
+                if not is_saturday(sat) or sat in hols:
+                    continue
+                sun = sat + timedelta(days=1)
+                if not (sun.year == year and sun.month == month):
+                    continue
+                sat_an = schedule.get(sat.isoformat(), {}).get("AN")
+                sun_pn = schedule.get(sun.isoformat(), {}).get("PN")
+                if sat_an and sun_pn and sat_an == sun_pn:
+                    weekend_pairs.append((sat, sat_an))
+
+            for i in range(len(weekend_pairs)):
+                sat_a, person_a = weekend_pairs[i]
+                if person_a not in hi_people:
+                    continue
+                sun_a = sat_a + timedelta(days=1)
+                for j in range(len(weekend_pairs)):
+                    if i == j:
+                        continue
+                    sat_b, person_b = weekend_pairs[j]
+                    if person_b not in lo_people:
+                        continue
+                    sun_b = sat_b + timedelta(days=1)
+
+                    sat_a_iso, sun_a_iso = sat_a.isoformat(), sun_a.isoformat()
+                    sat_b_iso, sun_b_iso = sat_b.isoformat(), sun_b.isoformat()
+
+                    schedule[sat_a_iso].pop("AN", None)
+                    schedule[sat_b_iso].pop("AN", None)
+                    schedule[sun_a_iso].pop("PN", None)
+                    schedule[sun_b_iso].pop("PN", None)
+
+                    feasible = (
+                        no_consecutive_saturday_ok(person_b, sat_a)
+                        and no_consecutive_saturday_ok(person_a, sat_b)
+                        and can_assign_primary(sat_a, "AN", person_b, strict_mode=False)
+                        and can_assign_primary(sun_a, "PN", person_b, strict_mode=False)
+                        and can_assign_primary(sat_b, "AN", person_a, strict_mode=False)
+                        and can_assign_primary(sun_b, "PN", person_a, strict_mode=False)
+                    )
+
+                    if feasible:
+                        schedule[sat_a_iso]["AN"] = person_b
+                        schedule[sun_a_iso]["PN"] = person_b
+                        schedule[sat_b_iso]["AN"] = person_a
+                        schedule[sun_b_iso]["PN"] = person_a
+
+                        role_counts["AN"][person_a] -= 1
+                        role_counts["AN"][person_b] += 1
+                        role_counts["AN"][person_b] -= 1
+                        role_counts["AN"][person_a] += 1
+                        role_counts["PN"][person_a] -= 1
+                        role_counts["PN"][person_b] += 1
+                        role_counts["PN"][person_b] -= 1
+                        role_counts["PN"][person_a] += 1
+
+                        total_hours[person_a] -= 8
+                        total_hours[person_b] += 8
+                        total_hours[person_b] -= 8
+                        total_hours[person_a] += 8
+                        total_hours[person_a] -= 5
+                        total_hours[person_b] += 5
+                        total_hours[person_b] -= 5
+                        total_hours[person_a] += 5
+
+                        pn_weekday_counts[person_a][0] -= 1
+                        pn_weekday_counts[person_b][0] += 1
+                        pn_weekday_counts[person_b][0] -= 1
+                        pn_weekday_counts[person_a][0] += 1
+
+                        moves += 1
+                        moved = True
+                    else:
+                        schedule[sat_a_iso]["AN"] = person_a
+                        schedule[sun_a_iso]["PN"] = person_a
+                        schedule[sat_b_iso]["AN"] = person_b
+                        schedule[sun_b_iso]["PN"] = person_b
+
+                    if moved:
+                        break
+                if moved:
+                    break
+
+            if not moved:
+                final_spread = saturday_spread(counts_with_roster())
+                print(f"Saturday fairness ({stage_label}): moves={moves}, spread={final_spread}")
+                return moves, final_spread
+
+    saturday_fairness_pass("post-primaries")
 
     
     roster_size = len(config.roster)
@@ -1911,6 +2108,8 @@ def build_schedule(config: BuildConfig,
             continue
         compact_bu_for_day(d.isoformat())
 
+    saturday_fairness_pass("post-bu")
+
     # print("Warning: Could not fill all desired BU slots.")
     print("\n--- Schedule Fairness Audit ---")
     print(f"{'Name':<10} {'PN (Tgt)':<10} {'AN':<5} {'W':<5} {'TotHrs':<8}")
@@ -1992,6 +2191,22 @@ def weekday_staff_metrics(
             eligible_min_assigned_on_weekday if eligible_min_assigned_on_weekday is not None else 0
         ),
     }
+
+
+def validate_saturday_spread(
+    schedule: Dict[str, Dict[str, str]],
+    year: int,
+    month: int,
+    hols: Set[date],
+    roster: List[str],
+    max_spread: int = 1,
+) -> Tuple[bool, str]:
+    counts = saturday_work_counts(schedule, year, month, hols)
+    for p in roster:
+        counts.setdefault(p, 0)
+    spread = saturday_spread(counts)
+    msg = f"Saturday spread={spread}, counts={counts}"
+    return spread <= max_spread, msg
 
 
 def bu_deficit_metrics(
@@ -2691,10 +2906,12 @@ def main():
                 bu_metrics = bu_deficit_metrics(candidate, year, month, len(roster))
                 wk_over40 = weekly_over40_events(candidate, prev, roster, year, month)
                 pp_over80 = payperiod_over80_events(candidate, prev, roster, pps, year, month)
+                sat_spread = saturday_spread(saturday_work_counts(candidate, year, month, hols))
 
                 score = (
                     metrics["eligible_days_with_target_or_more"],
                     -metrics["eligible_deficit_sum_to_target"],
+                    -sat_spread,
                     -bu_metrics["bu2_bu3_missing"],
                     -bu_metrics["total_bu_missing"],
                     -wk_over40,
@@ -2774,6 +2991,10 @@ def main():
 
         oj = args.out_json or str(Path(args.prev_schedule).with_name(f"{year}_{month:02d}_schedule.json"))
         ox = args.out_xlsx or str(Path(args.prev_schedule).with_name(f"{calendar.month_name[month]}_{year}_Schedule.xlsx"))
+
+        sat_ok, sat_msg = validate_saturday_spread(sched, year, month, hols, roster)
+        sat_status = "OK" if sat_ok else "INFO"
+        print(f"Saturday spread ({sat_status}): {sat_msg}")
 
         Path(oj).write_text(json.dumps(sched, indent=2), "utf-8")
         print(f"✅ JSON: {oj}")
