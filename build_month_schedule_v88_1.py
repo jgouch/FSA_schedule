@@ -1,0 +1,3342 @@
+#!/usr/bin/env python3
+"""
+build_month_schedule_v88_1.py
+
+End-to-end month builder:
+- Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
+- Reads prior month schedule JSON for cross-month constraints
+- Generates schedule for target month (primaries then BU)
+- Exports:
+    - schedule JSON (machine truth)
+    - Excel calendar workbook (Calendar, Summary, Weekly Hours, Pay Period Hours, Violations)
+
+LOCKED CALENDAR GEOMETRY:
+- Grid weeks: Dynamic (5 or 6) based on month shape.
+- Each day block: 3 columns x 8 rows
+- Role mapping (R = week_start_row, cols = start/mid/end):
+    PN label: (start, R+1), PN name: (mid, R+1)
+    AN label: (start, R+2), AN name: (mid, R+2)
+    W  label: (start, R+3), W  name: (mid, R+3)
+    BU1 name: (mid, R+4)
+    BU2 name: (mid, R+5)
+    BU3 name: (mid, R+6)
+    BU4 name (push-week Saturday only): (mid, R+7)
+
+Logic Changes (v88.1):
+- FIX (v88.1): Primary Saturday adjacency is strict across any prior Saturday work (PRIMARY or BU). Push-week exception applies only to BU after prior PRIMARY; BU→BU remains blocked; forward-check blocks solver-order bypass.
+- FIX (v88.1): PN sales-rank preference pass skips holidays and uses counter-consistent feasibility testing.
+- FIX (v88): Role-aware “no consecutive Saturdays”: PRIMARY roles never allowed to be consecutive, even in push/holiday weeks; BU roles may use push-week exception when prior Saturday was a PRIMARY.
+- IMPROVE (v88): PN preference pass: after schedule build, attempt to align PN counts with previous month’s sales rank where feasible (without breaking Saturday fairness and without changing Sunday PN rotation).
+- PERF (v87): Open scheduler input workbook only once (data_only=True) and reuse worksheets for roster/timeoff/sales loads.
+- FIX (v87): Heartbeat enablement threshold now matters (no redundant args.auto_seed OR).
+- FIX (v85): Actually delete cache clears inside auto-seed loop for massive speedup; fix missing borders and heights on dynamically generated Day headers.
+- FIX (v84): Fix missing borders on Holiday merged cells in template fallback; add flush=True to verbose auto-seed prints to prevent terminal stutter.
+- FIX (v83): Graceful template fallback now includes Day of Week headers; filter out ghost employees in constraints; remove cache destruction in auto-seed loop.
+- FIX (v82): Graceful fallback to draw the calendar grid from scratch if no template is provided.
+- FIX (v80): Repair BU1 delta balancing (can_bu ordering + cap bypass), correct Saturday fairness swap accounting.
+- FIX (v79): Add Saturday fairness balancing pass to evenly distribute Saturday work across the team.
+- FIX (v78): BU1 fairness now continues from primary remainder pointer (W->BU1 carryover).
+- FIX (v77): Enforce 4-unique weekday staffing when available_count >= 4; prioritize constrained days first.
+- FIX (v76): Auto-seed auto-enables weekday-target-repair when enforcing target staffing.
+- FIX (v74): Consistent unique-assignee counting; BU sequencing enforced (no BU2 without BU1).
+- FIX (v72): Fix Sales Ranking quarter regex; ignore blank/None values in staffing validators.
+- FIX (v71): Restore dynamic default target_weekday_staff (scales with roster size).
+- FIX (v69): BU1 targets now use primary remainder rotation (PN->AN->W->BU1).
+- FIX (v68): Relax cross-month Sat AN -> Sun PN pairing when prior-month AN assignee is not active.
+- FIX (v65): Dynamic staffing scaling for changing roster size.
+"""
+
+from __future__ import annotations
+
+import argparse
+import calendar
+import contextlib
+import io
+import json
+import random
+import re
+import sys
+import threading
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.datetime import from_excel
+
+
+# ----------------------------
+# Constants / settings
+# ----------------------------
+
+SUNDAY_FILL = "FFF2CC"
+NONMONTH_FILL = "F2F2F2"
+WHITE_FILL_HEX = "FFFFFF"
+OVERTIME_FILL = "FFC7CE" # Red fill for >40h weeks
+
+FONT_MAIN = Font(name="Calibri", size=11)
+FONT_DAY_NUM = Font(name="Calibri", size=11, bold=True)
+FONT_HEADER = Font(name="Calibri", size=24, bold=True)
+ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+THIN_BORDER = Border(left=Side(style='thin'), 
+                     right=Side(style='thin'), 
+                     top=Side(style='thin'), 
+                     bottom=Side(style='thin'))
+
+GRID_WEEK_START_ROW = 3
+WEEK_HEIGHT = 8
+DAY_WIDTH = 3
+SUN_START_COL = 2  # B
+
+ROLE_PRIMARY = ["PN", "AN", "W"]
+ROLE_BUS = ["BU1", "BU2", "BU3", "BU4"]
+
+OBSERVED_HOLIDAYS_BY_YEAR = {
+    2026: {
+        date(2026, 1, 1),   # New Year's Day
+        date(2026, 5, 25),  # Memorial Day
+        date(2026, 7, 3),   # Independence Day observed
+        date(2026, 9, 7),   # Labor Day
+        date(2026, 11, 26), # Thanksgiving
+        date(2026, 12, 25), # Christmas
+    }
+}
+
+DEFAULT_ROSTER = ["Greg", "Mark", "Dawn", "Will", "CJ", "Kyle"]
+SENIORITY_ORDER = ["Mark", "Dawn", "Will", "Kyle", "CJ", "Greg"]
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def weekday_sun0(d: date) -> int:
+    return (d.weekday() + 1) % 7
+
+def is_sunday(d: date) -> bool:
+    return weekday_sun0(d) == 0
+
+def is_saturday(d: date) -> bool:
+    return weekday_sun0(d) == 6
+
+def is_weekday(d: date) -> bool:
+    return d.weekday() < 5
+
+def month_days(year: int, month: int) -> List[date]:
+    n = calendar.monthrange(year, month)[1]
+    return [date(year, month, d) for d in range(1, n+1)]
+
+def quarter_tag_for_month(year: int, month: int) -> str:
+    q = (month - 1) // 3 + 1
+    return f"{year}Q{q}"
+
+def norm_name(x) -> str:
+    return re.sub(r"\s+", " ", str(x).strip())
+
+def _normalize_header_key(value: str) -> str:
+    """Normalize column headers so minor spacing/punctuation differences still match."""
+    return re.sub(r"[^a-z0-9]", "", str(value).strip().lower())
+
+def normalize_quarter_key(s: str) -> str:
+    """Normalize '2026 Q1' -> '2026Q1'."""
+    return re.sub(r"\s+", "", str(s).strip().upper())
+
+def parse_month_arg(s: str) -> Tuple[int, int]:
+    m = re.match(r"^\s*(\d{4})-(\d{2})\s*$", s)
+    if not m:
+        raise ValueError("Month must be YYYY-MM, e.g. 2026-02")
+    year = int(m.group(1))
+    month = int(m.group(2))
+    if not 1 <= month <= 12:
+        raise ValueError(f"Month out of range in '{s}'. Expected 01..12")
+    return year, month
+
+def compute_observed_holidays_us(year: int) -> Set[date]:
+    out: Set[date] = set()
+    out.add(date(year, 1, 1))
+    d = date(year, 5, 31)
+    while d.weekday() != 0: d -= timedelta(days=1)
+    out.add(d)
+    july4 = date(year, 7, 4)
+    if july4.weekday() == 5: out.add(date(year, 7, 3))
+    elif july4.weekday() == 6: out.add(date(year, 7, 5))
+    else: out.add(july4)
+    d = date(year, 9, 1)
+    while d.weekday() != 0: d += timedelta(days=1)
+    out.add(d)
+    d = date(year, 11, 1)
+    while d.weekday() != 3: d += timedelta(days=1)
+    out.add(d + timedelta(days=21))
+
+    # Christmas observed rule (Fri if Saturday holiday, Mon if Sunday holiday)
+    xmas = date(year, 12, 25)
+    if xmas.weekday() == 5:
+        out.add(date(year, 12, 24))
+    elif xmas.weekday() == 6:
+        out.add(date(year, 12, 26))
+    else:
+        out.add(xmas)
+    return out
+
+_hols_cache = {}
+def observed_holidays_for_year(year: int) -> Set[date]:
+    if year in _hols_cache:
+        return _hols_cache[year]
+    
+    hols = OBSERVED_HOLIDAYS_BY_YEAR.get(year, compute_observed_holidays_us(year))
+    _hols_cache[year] = hols
+    return hols
+
+def week_start_sun(d: date) -> date:
+    return d - timedelta(days=weekday_sun0(d))
+
+def generate_payperiods(anchor_start: date, start_date: date, end_date: date) -> List[Tuple[date, date]]:
+    a = anchor_start
+    while a > start_date:
+        a -= timedelta(days=14)
+    periods: List[Tuple[date, date]] = []
+    cur = a
+    while cur <= end_date:
+        periods.append((cur, cur + timedelta(days=13)))
+        cur += timedelta(days=14)
+    return periods
+
+def parse_excel_date(value) -> date:
+    if isinstance(value, datetime): return value.date()
+    if isinstance(value, date): return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try: return from_excel(value).date()
+        except Exception as e: 
+            raise ValueError(f"Failed to parse numeric Excel date: {value}. Error: {e}")
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+        try: return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognized date format: {value!r}")
+
+def _rotate_left(lst: List[str], k: int) -> List[str]:
+    if not lst: return lst
+    k = k % len(lst)
+    return lst[k:] + lst[:k]
+
+def distribute_with_cursor(order: List[str], total: int, n: int, cursor: int) -> Tuple[Dict[str, int], int]:
+    if n <= 0:
+        raise ValueError("n must be positive in distribute_with_cursor")
+    if len(order) != n:
+        raise ValueError(f"distribute_with_cursor: len(order)!=n (len(order)={len(order)}, n={n})")
+    if len(set(order)) != n:
+        raise ValueError("distribute_with_cursor: duplicate names in order")
+    base = total // n
+    rem = total % n
+    targets = {p: base for p in order}
+    for i in range(rem):
+        targets[order[(cursor + i) % n]] += 1
+    cursor = (cursor + rem) % n
+    return targets, cursor
+
+def default_min_weekday_staff(roster_size: int) -> int:
+    if roster_size <= 2:
+        return roster_size
+    if roster_size == 3:
+        return 3
+    if roster_size == 4:
+        return 3
+    return 4
+
+def unique_assignees(values) -> Set[str]:
+    return {v for v in values if v is not None and str(v).strip() != ""}
+
+def unique_assignee_count(role_map: Dict[str, str]) -> int:
+    return len(unique_assignees(role_map.values()))
+
+
+def saturday_work_counts(
+    schedule: Dict[str, Dict[str, str]],
+    year: int,
+    month: int,
+    hols: Set[date],
+    roster: Optional[List[str]] = None,
+) -> Dict[str, int]:
+    people: Set[str] = set(roster or [])
+    for rmap in schedule.values():
+        people.update(unique_assignees(rmap.values()))
+
+    counts = {person: 0 for person in people}
+    for d in month_days(year, month):
+        if not is_saturday(d) or d in hols:
+            continue
+        assigned = unique_assignees(schedule.get(d.isoformat(), {}).values())
+        for person in assigned:
+            counts.setdefault(person, 0)
+            counts[person] += 1
+    return counts
+
+
+def saturday_spread(counts: Dict[str, int]) -> int:
+    if not counts:
+        return 0
+    vals = list(counts.values())
+    return max(vals) - min(vals)
+
+# Global logic checks
+_week_push_cache: Dict[date, bool] = {}
+_week_hol_cache: Dict[date, bool] = {}
+
+def week_contains_push(ws: date) -> bool:
+    if ws in _week_push_cache:
+        return _week_push_cache[ws]
+    out = False
+    for i in range(7):
+        d = ws + timedelta(days=i)
+        if d in get_push_days_for_month(d.year, d.month):
+            out = True
+            break
+    _week_push_cache[ws] = out
+    return out
+
+def week_contains_holiday(ws: date) -> bool:
+    if ws in _week_hol_cache:
+        return _week_hol_cache[ws]
+    out = False
+    for i in range(7):
+        d = ws + timedelta(days=i)
+        if d in observed_holidays_for_year(d.year):
+            out = True
+            break
+    _week_hol_cache[ws] = out
+    return out
+
+# Global hours calculator (Single Source of Truth)
+def calculate_daily_hours(dd: date, name: str, schedule: Dict, prev_sched: Dict, year: int, month: int) -> int:
+    """Calculate hours for a person on a specific date, handling month boundaries."""
+
+    if dd.year == year and dd.month == month:
+        roles = schedule.get(dd.isoformat(), {})
+        if name not in roles.values():
+            return 0
+        hols = observed_holidays_for_year(dd.year)
+        dh = 0
+        for r, n in roles.items():
+            if n == name: dh = max(dh, hours_for_role(dd, r, hols))
+        return dh
+    elif dd < date(year, month, 1):
+        roles = prev_sched.get(dd.isoformat(), {})
+        if name not in roles.values():
+            return 0
+        hols = observed_holidays_for_year(dd.year)
+        dh = 0
+        for r, n in roles.items():
+            if n == name: dh = max(dh, hours_for_role(dd, r, hols))
+        return dh
+    return 0
+
+
+# ----------------------------
+# Inputs
+# ----------------------------
+
+@dataclass
+class TimeOffRule:
+    name: str
+    d: date
+    hard: bool = True
+    avoid_roles: Set[str] = field(default_factory=set)
+
+@dataclass
+class Constraints:
+    hard_off: Dict[date, Set[str]]
+    avoid_roles: Dict[Tuple[date, str], Set[str]]
+
+def compile_constraints(timeoff: List[TimeOffRule], roster: List[str]) -> Constraints:
+    hard_off: Dict[date, Set[str]] = {}
+    avoid_roles: Dict[Tuple[date, str], Set[str]] = {}
+    roster_set = set(roster)
+
+    for r in timeoff:
+        if r.name not in roster_set:
+            continue  # Ignore requests from inactive/former employees
+
+        if r.hard:
+            hard_off.setdefault(r.d, set()).add(r.name)
+        if r.avoid_roles:
+            for role in r.avoid_roles:
+                avoid_roles.setdefault((r.d, role.upper()), set()).add(r.name)
+    return Constraints(hard_off=hard_off, avoid_roles=avoid_roles)
+
+def load_timeoff_from_ws(ws) -> List[TimeOffRule]:
+    headers = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(1, c).value
+        if v:
+            headers[_normalize_header_key(v)] = c
+
+    c_name = headers.get("name")
+    if not c_name:
+        raise ValueError("TimeOff sheet missing 'Name' column")
+    c_date = headers.get("date")
+    c_start = headers.get("start")
+    c_end = headers.get("end")
+    c_hard = headers.get("hard")
+    c_avoid = headers.get("avoidroles")
+
+    def parse_hard(v) -> bool:
+        if v is None or str(v).strip() == "": return True
+        return str(v).strip().lower() in ("true", "1", "yes", "y")
+
+    rules = []
+    for r in range(2, ws.max_row + 1):
+        nv = ws.cell(r, c_name).value
+        if not nv: continue
+        name = norm_name(nv)
+
+        dates = []
+        dv = ws.cell(r, c_date).value if c_date else None
+        sv = ws.cell(r, c_start).value if c_start else None
+        ev = ws.cell(r, c_end).value if c_end else None
+
+        if dv:
+            dates = [parse_excel_date(dv)]
+        elif sv and ev:
+            sd = parse_excel_date(sv)
+            ed = parse_excel_date(ev)
+            if ed < sd:
+                raise ValueError(f"Invalid time-off range for {name}: start {sd} is after end {ed}")
+            cur = sd
+            while cur <= ed:
+                dates.append(cur)
+                cur += timedelta(days=1)
+        else:
+            continue
+
+        hard = parse_hard(ws.cell(r, c_hard).value) if c_hard else True
+        av = set()
+        if c_avoid:
+            val = ws.cell(r, c_avoid).value
+            if val:
+                av = {p.strip().upper() for p in str(val).split(",") if p.strip()}
+                invalid = av - set(ROLE_PRIMARY + ROLE_BUS)
+                if invalid:
+                    raise ValueError(
+                        f"Unknown role(s) in AvoidRoles for {name} on row {r}: {sorted(invalid)}"
+                    )
+
+        for d in dates:
+            rules.append(TimeOffRule(name, d, hard, av))
+    return rules
+
+def load_timeoff_from_xlsx(xlsx_path: str, sheet_name: str) -> List[TimeOffRule]:
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"Missing timeoff sheet '{sheet_name}'")
+        return load_timeoff_from_ws(wb[sheet_name])
+    finally:
+        wb.close()
+
+def load_roster_from_json(path: str) -> List[str]:
+    data = json.loads(Path(path).read_text("utf-8"))
+    if not isinstance(data, list) or not data:
+        raise ValueError("Roster JSON must be a non-empty list of names")
+
+    roster = [norm_name(x) for x in data if str(x).strip()]
+    if not roster:
+        raise ValueError("Roster JSON must contain at least one non-blank name")
+    return roster
+
+def load_roster_from_timeoff_xlsx(
+    xlsx_path: str,
+    sheet_name: str,
+    year: int,
+    month: int,
+) -> Optional[List[str]]:
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            return None
+        return load_roster_from_ws(wb[sheet_name], year, month)
+    finally:
+        wb.close()
+
+def load_roster_from_ws(
+    ws,
+    year: int,
+    month: int,
+) -> Optional[List[str]]:
+    headers = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(1, c).value
+        if v:
+            headers[_normalize_header_key(v)] = c
+
+    c_name = headers.get("name")
+    if not c_name:
+        raise ValueError(f"Roster sheet '{ws.title}' missing required 'Name' column")
+
+    c_active = headers.get("active")
+    if c_active is None:
+        c_active = headers.get("status")
+    c_start = headers.get("start")
+    c_end = headers.get("end")
+
+    month_start = date(year, month, 1)
+    month_end = date(year, month, calendar.monthrange(year, month)[1])
+
+    def parse_active(v) -> bool:
+        if v is None:
+            return True
+        s = str(v).strip()
+        if s == "":
+            return True
+        u = s.upper()
+        if u in {"Y", "YES", "TRUE", "1"}:
+            return True
+        if u in {"N", "NO", "FALSE", "0"}:
+            return False
+        return True
+
+    roster: List[str] = []
+    seen: Set[str] = set()
+    for r in range(2, ws.max_row + 1):
+        nv = ws.cell(r, c_name).value
+        if nv is None or str(nv).strip() == "":
+            continue
+        name = norm_name(nv)
+        if not name:
+            continue
+
+        is_active = parse_active(ws.cell(r, c_active).value) if c_active else True
+        if not is_active:
+            continue
+
+        sv = ws.cell(r, c_start).value if c_start else None
+        ev = ws.cell(r, c_end).value if c_end else None
+        sd = parse_excel_date(sv) if sv not in (None, "") else None
+        ed = parse_excel_date(ev) if ev not in (None, "") else None
+
+        if sd and sd > month_end:
+            continue
+        if ed and ed < month_start:
+            continue
+
+        if name not in seen:
+            seen.add(name)
+            roster.append(name)
+
+    if not roster:
+        raise ValueError(
+            f"Roster sheet '{ws.title}' exists but contains zero active roster names for {year}-{month:02d}"
+        )
+    return roster
+
+def load_payperiods_from_json(path: str) -> List[Tuple[date, date]]:
+    data = json.loads(Path(path).read_text("utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("Pay periods JSON must be a list of objects with 'start' and 'end'")
+    out = []
+    for obj in data:
+        if not isinstance(obj, dict):
+            raise ValueError("Each pay period entry must be an object with 'start' and 'end'")
+        if "start" not in obj or "end" not in obj:
+            raise ValueError(f"Pay period entry missing required keys: {obj}")
+        s = datetime.strptime(str(obj["start"]).strip(), "%Y-%m-%d").date()
+        e = datetime.strptime(str(obj["end"]).strip(), "%Y-%m-%d").date()
+        if e < s:
+            raise ValueError(f"Pay period end before start: {s}..{e}")
+        out.append((s, e))
+    out.sort(key=lambda t: t[0])
+    return out
+
+def load_sales_ranking_from_timeoff_xlsx(xlsx_path, sheet_name, year, month, roster_names):
+    wb = openpyxl.load_workbook(xlsx_path, data_only=True)
+    try:
+        if sheet_name not in wb.sheetnames:
+            raise ValueError(f"Missing sheet '{sheet_name}'")
+        return load_sales_ranking_from_ws(wb[sheet_name], year, month, roster_names)
+    finally:
+        wb.close()
+
+def load_sales_ranking_from_ws(ws, year, month, roster_names):
+    cutoff = date(year, month, 1) - timedelta(days=1)
+    parsed_rows = []
+    fallback_rows = []
+    for r in range(2, ws.max_row + 1):
+        p = ws.cell(r, 1).value
+        if not p:
+            continue
+        ranks = []
+        for c in range(2, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if v and str(v).strip():
+                ranks.append(norm_name(v))
+        if not ranks:
+            continue
+
+        fallback_rows.append((r, p, ranks))
+
+        period_end: Optional[date] = None
+        try:
+            pd = parse_excel_date(p)
+            period_end = date(pd.year, pd.month, calendar.monthrange(pd.year, pd.month)[1])
+        except Exception:
+            s = str(p).strip()
+            qm = re.match(r"^(\d{4})\s*Q([1-4])$", s, flags=re.IGNORECASE)
+            if qm:
+                qy = int(qm.group(1))
+                qn = int(qm.group(2))
+                q_end_month = qn * 3
+                period_end = date(qy, q_end_month, calendar.monthrange(qy, q_end_month)[1])
+            else:
+                mm = re.match(r"^(\d{4})-(\d{2})$", s)
+                if mm:
+                    my = int(mm.group(1))
+                    mmn = int(mm.group(2))
+                    if 1 <= mmn <= 12:
+                        period_end = date(my, mmn, calendar.monthrange(my, mmn)[1])
+
+        if period_end is not None:
+            parsed_rows.append((period_end, r, ranks))
+
+    order = None
+    closed_rows = [item for item in parsed_rows if item[0] <= cutoff]
+    if closed_rows:
+        closed_rows.sort(key=lambda t: (t[0], t[1]))
+        order = closed_rows[-1][2]
+    elif parsed_rows:
+        parsed_rows.sort(key=lambda t: (t[0], t[1]))
+        order = parsed_rows[-1][2]
+    elif fallback_rows:
+        order = fallback_rows[-1][2]
+
+    roster_set = set(roster_names)
+    if not order:
+        return [n for n in SENIORITY_ORDER if n in roster_set] + [n for n in roster_names if n not in SENIORITY_ORDER]
+
+    order = [x for x in order if x in roster_set]
+    for p in roster_names:
+        if p in roster_set and p not in order:
+            order.append(p)
+    return order
+
+def load_schedule_json(path: str) -> Dict[str, Dict[str, str]]:
+    data = json.loads(Path(path).read_text("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Schedule JSON must be a dictionary")
+    iso_pat = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    for k, v in data.items():
+        if not iso_pat.match(k):
+             raise ValueError(f"Invalid date key in schedule JSON: {k} (Must be YYYY-MM-DD)")
+        if not isinstance(v, dict):
+             raise ValueError(f"Schedule JSON invalid at key {k}: value must be a dictionary")
+    return data
+
+def role_of(prev, d, name):
+    roles = prev.get(d.isoformat(), {})
+    for r, n in roles.items():
+        if n == name: return r
+    return None
+
+def worked_prev(prev, d, name):
+    return name in prev.get(d.isoformat(), {}).values()
+
+
+# ----------------------------
+# Core Logic
+# ----------------------------
+
+def roles_required_for_day(d: date, hols: Set[date]) -> List[str]:
+    if d in hols: return []
+    if is_sunday(d): return ["PN"]
+    req = ["PN", "AN"]
+    if is_weekday(d): req.append("W")
+    return req
+
+def hours_for_role(d: date, role: str, hols: Set[date]) -> int:
+    if d in hols: return 0
+    if is_sunday(d) and role == "PN": return 5
+    return 8
+
+def push_days_for_month(year: int, month: int) -> Set[date]:
+    """Return set of dates that are 'Push Days' (Last occurrence of Mon-Sat)."""
+    days = set()
+    last_dom = calendar.monthrange(year, month)[1]
+    last = date(year, month, last_dom)
+    for wd in range(6): 
+        cur = last
+        while cur.weekday() != wd:
+            cur -= timedelta(days=1)
+        if cur.month == month:
+            days.add(cur)
+    return days
+
+_push_days_cache = {}
+def get_push_days_for_month(year: int, month: int) -> Set[date]:
+    key = (year, month)
+    if key in _push_days_cache:
+        return _push_days_cache[key]
+    days = push_days_for_month(year, month)
+    _push_days_cache[key] = days
+    return days
+
+def ideal_bu_roles_for_day(d: date, roster_size: int) -> List[str]:
+    if d in observed_holidays_for_year(d.year):
+        return []
+    if is_sunday(d):
+        return []
+
+    is_push_day = d in get_push_days_for_month(d.year, d.month)
+    is_monday = weekday_sun0(d) == 1
+    bu1_bu2 = ["BU1", "BU2"]
+    bu1_bu2_bu3 = ["BU1", "BU2", "BU3"]
+
+    if is_saturday(d):
+        if not is_push_day:
+            return []
+        if roster_size <= 5:
+            return bu1_bu2_bu3
+        return ["BU1", "BU2", "BU3", "BU4"]
+
+    if roster_size <= 5:
+        if is_push_day:
+            return bu1_bu2
+        if is_monday:
+            return bu1_bu2
+        if is_weekday(d):
+            return ["BU1"]
+        return []
+
+    if is_push_day:
+        return bu1_bu2_bu3
+    if is_monday:
+        return bu1_bu2_bu3
+    if is_weekday(d):
+        return bu1_bu2
+    return []
+
+@dataclass
+class BuildConfig:
+    year: int
+    month: int
+    roster: List[str]
+    sales_order: List[str]
+    max_consecutive_days: int = 5
+    lookback_days: int = 14
+    rng_seed: int = 11
+    enable_weekday_target_repair: bool = False
+    enable_primary_swap_repair: bool = False
+    weekday_target_repair_verbose: bool = False
+    target_weekday_staff: int = 5
+    min_weekday_staff: int = 4
+
+def compute_primary_targets(days, roster, sales_order, hols):
+    if not roster:
+        raise ValueError("Roster cannot be empty when computing primary targets")
+
+    opp = {"PN": 0, "AN": 0, "W": 0}
+    for d in days:
+        req = roles_required_for_day(d, hols)
+        for r in opp:
+            if r in req: opp[r] += 1
+            
+    n = len(roster)
+    targets = {r: {p: 0 for p in roster} for r in opp}
+    
+    roster_set = set(roster)
+    valid_order = [x for x in sales_order if x in roster_set]
+    missing = [x for x in roster if x not in valid_order]
+    full_priority = valid_order + missing
+    
+    cursor = 0
+    for role in ("PN", "AN", "W"):
+        role_targets, cursor = distribute_with_cursor(full_priority, opp[role], n, cursor)
+        for p in roster:
+            targets[role][p] = role_targets[p]
+    return targets, cursor, full_priority
+
+
+def build_schedule(config: BuildConfig,
+                   prev_sched: Dict[str, Dict[str, str]],
+                   cons: Constraints,
+                   payperiods: Optional[List[Tuple[date, date]]] = None) -> Dict[str, Dict[str, str]]:
+    
+    rng = random.Random(config.rng_seed)
+    year, month = config.year, config.month
+    days = month_days(year, month)
+    roster_set = {norm_name(person) for person in config.roster}
+    roster_map = {norm_name(person): person for person in config.roster}
+    
+    hols = observed_holidays_for_year(year)
+    targets, primary_remainder_cursor, primary_priority_order = compute_primary_targets(days, config.roster, config.sales_order, hols)
+
+    schedule: Dict[str, Dict[str, str]] = {}
+    day_difficulty: Dict[date, Tuple[int, int, int, int, date]] = {}
+    for d in days:
+        if d in hols or not is_weekday(d):
+            continue
+        hard_off = cons.hard_off.get(d, set())
+        available = len(config.roster) - len(hard_off)
+        tight = 1 if (available == config.target_weekday_staff) else 0
+        must_hit = 1 if (available >= config.target_weekday_staff) else 0
+        day_difficulty[d] = (
+            -must_hit,
+            -tight,
+            available,
+            -len(hard_off),
+            d,
+        )
+    role_counts = {r: {n: 0 for n in config.roster} for r in ["PN", "AN", "W"]}
+    total_hours = {n: 0 for n in config.roster}
+    pn_weekday_counts = {n: {i: 0 for i in range(7)} for n in config.roster}
+    monday_pn_used = {n: 0 for n in config.roster}
+
+    def reset_state():
+        nonlocal schedule, role_counts, total_hours, pn_weekday_counts, monday_pn_used
+        schedule = {d.isoformat(): {} for d in days}
+        role_counts = {r: {n: 0 for n in config.roster} for r in ["PN", "AN", "W"]}
+        total_hours = {n: 0 for n in config.roster}
+        pn_weekday_counts = {n: {i: 0 for i in range(7)} for n in config.roster}
+        monday_pn_used = {n: 0 for n in config.roster}
+
+    def consecutive_streak(name, d):
+        streak = 0
+        for k in range(1, config.lookback_days + 1):
+            p = d - timedelta(days=k)
+            worked = False
+            if p.year == year and p.month == month:
+                worked = name in schedule.get(p.isoformat(), {}).values()
+            else:
+                worked = worked_prev(prev_sched, p, name)
+            if worked: streak += 1
+            else: break
+        return streak
+    def consecutive_span(name, d):
+
+        """Return (before, after) consecutive worked-day counts around date d, given current partial schedule.
+
+        Counts contiguous days immediately before d and immediately after d where the person already has ANY role.
+
+        Uses prev_sched for days < month start, and schedule for days within the target month.
+
+        """
+
+        before = 0
+
+        for k in range(1, config.lookback_days + 1):
+
+            p = d - timedelta(days=k)
+
+            if p.year == year and p.month == month:
+
+                worked = name in schedule.get(p.isoformat(), {}).values()
+
+            else:
+
+                worked = worked_prev(prev_sched, p, name)
+
+            if worked:
+
+                before += 1
+
+            else:
+
+                break
+
+        after = 0
+
+        for k in range(1, config.lookback_days + 1):
+
+            n = d + timedelta(days=k)
+
+            if not (n.year == year and n.month == month):
+
+                break
+
+            worked = name in schedule.get(n.isoformat(), {}).values()
+
+            if worked:
+
+                after += 1
+
+            else:
+
+                break
+
+        return before, after
+
+
+    week_hours_cache: Dict[Tuple[str, date], int] = {}
+    pp_hours_cache: Dict[Tuple[str, date], int] = {}
+
+    def invalidate_hours_caches(person: str, d: date) -> None:
+        ws = week_start_sun(d)
+        week_hours_cache.pop((person, ws), None)
+        if payperiods:
+            pp = find_pp(d)
+            if pp:
+                s, _ = pp
+                pp_hours_cache.pop((person, s), None)
+
+    def week_hours(name, d):
+        ws = week_start_sun(d)
+        key = (name, ws)
+        if key in week_hours_cache:
+            return week_hours_cache[key]
+        tot = 0
+        for i in range(7):
+            dd = ws + timedelta(days=i)
+            tot += calculate_daily_hours(dd, name, schedule, prev_sched, year, month)
+        week_hours_cache[key] = tot
+        return tot
+
+    def find_pp(d):
+        if not payperiods: return None
+        for s, e in payperiods:
+            if s <= d <= e: return (s, e)
+        return None
+
+    def pp_hours(name, d):
+        pp = find_pp(d)
+        if not pp: return 0
+        s, e = pp
+        key = (name, s)
+        if key in pp_hours_cache:
+            return pp_hours_cache[key]
+        tot = 0
+        cur = s
+        while cur <= e:
+            tot += calculate_daily_hours(cur, name, schedule, prev_sched, year, month)
+            cur += timedelta(days=1)
+        pp_hours_cache[key] = tot
+        return tot
+
+    def no_consecutive_saturday_ok(name: str, d: date, role: str) -> bool:
+        if not is_saturday(d):
+            return True
+
+        primary_roles = {"PN", "AN", "W"}
+
+        def sat_role_for_person(sat_day: date, person: str) -> Optional[str]:
+            if sat_day.year == year and sat_day.month == month:
+                day_roles = schedule.get(sat_day.isoformat(), {})
+            else:
+                day_roles = prev_sched.get(sat_day.isoformat(), {})
+
+            for rname, who_raw in day_roles.items():
+                who = roster_map.get(norm_name(who_raw))
+                if who != person:
+                    continue
+                if rname in primary_roles:
+                    return "PRIMARY"
+                if str(rname).startswith("BU"):
+                    return "BU"
+            return None
+
+        prev_sat = d - timedelta(days=7)
+        next_sat = d + timedelta(days=7)
+        prev_role = sat_role_for_person(prev_sat, name)
+        next_role = sat_role_for_person(next_sat, name) if (next_sat.year == year and next_sat.month == month) else None
+
+        if role in primary_roles:
+            if prev_role is not None:
+                return False
+            if next_role is not None:
+                return False
+            return True
+
+        ws_sat = week_start_sun(d)
+        is_push_or_holiday = week_contains_push(ws_sat) or week_contains_holiday(ws_sat)
+
+        if not is_push_or_holiday:
+            if prev_role is not None:
+                return False
+            if next_role is not None:
+                return False
+            return True
+
+        if prev_role == "BU":
+            return False
+        if next_role is not None:
+            return False
+        if prev_role == "PRIMARY":
+            return True
+        return True
+
+    def can_assign_primary(d, role, name, strict_mode):
+        if d in hols: return False
+        if name in cons.hard_off.get(d, set()): return False
+        if name in cons.avoid_roles.get((d, role), set()): return False
+        if name in schedule[d.isoformat()].values(): return False
+        
+        # No consecutive Saturdays with role-aware rules
+        if not no_consecutive_saturday_ok(name, d, role): return False
+        # B2B (Same Role) should mean previous CALENDAR day, not previous WORKED role
+        prev_d = d - timedelta(days=1)
+        prev_roles = schedule.get(prev_d.isoformat(), {})
+        if prev_d.month != month:
+            prev_roles = prev_sched.get(prev_d.isoformat(), {})
+        if prev_roles.get(role) == name: return False
+        if (d + timedelta(days=1)).month == month and schedule.get((d + timedelta(days=1)).isoformat(), {}).get(role) == name: return False
+
+        # Sat AN / Sun PN pairing guard (both directions) to avoid unpaired weekend handoff.
+        # Default: Sat AN must match Sun PN.
+        # Only exception: the Sunday PN person is hard-off on that Saturday.
+        if role == 'PN' and is_sunday(d):
+            sat = d - timedelta(days=1)
+            sat_hols = observed_holidays_for_year(sat.year)
+            if sat in sat_hols or sat in hols:
+                pass
+            elif name in cons.hard_off.get(sat, set()):
+                pass
+            else:
+                if sat.month == month:
+                    sat_an = schedule.get(sat.isoformat(), {}).get('AN')
+                    if sat_an and sat_an != name:
+                        return False
+                else:
+                    prev_an_raw = prev_sched.get(sat.isoformat(), {}).get('AN')
+                    if prev_an_raw is None or str(prev_an_raw).strip() == '':
+                        pass
+                    else:
+                        prev_an_norm = norm_name(prev_an_raw)
+                        prev_an_canon = roster_map.get(prev_an_norm)
+                        if prev_an_canon and prev_an_canon != name:
+                            return False
+
+
+        if role == 'AN' and is_saturday(d):
+            sun = d + timedelta(days=1)
+            sun_hols = observed_holidays_for_year(sun.year)
+            if sun in hols or sun in sun_hols:
+                pass
+            elif sun.month == month:
+                sun_pn = schedule.get(sun.isoformat(), {}).get('PN')
+                # Exception: if Sunday PN person is hard-off today (Saturday), allow mismatch.
+                # Sanity example: Feb 21 hard-off for Greg allows Sun 22 PN=Greg without forcing Sat 21 AN=Greg.
+                if sun_pn and (sun_pn not in cons.hard_off.get(d, set())) and sun_pn != name:
+                    return False
+            else:
+                # Cross-month: Sunday is in next month; pairing is validated when that month is built.
+                pass
+
+
+        # Push week relaxation: consecutive-days cap not enforced during push week
+        
+        ws = week_start_sun(d)
+        is_holiday_week = week_contains_holiday(ws)
+        is_push_week = week_contains_push(ws)
+        # Boundary safeguard: if this is the LAST day of the month and it's Saturday AN,
+        # cross-month pairing forces next-day Sunday PN. Prevent exceeding max consecutive days.
+        before, after = consecutive_span(name, d)
+        if role == 'AN' and is_saturday(d) and d.day == calendar.monthrange(year, month)[1] and (before + 2) > config.max_consecutive_days: return False
+        if (not is_push_week) and (before + 1 + after) > config.max_consecutive_days: return False
+        
+        if not (is_holiday_week or is_push_week):
+            wh = week_hours(name, d)
+            if wh + hours_for_role(d, role, hols) > 40: return False
+        
+        if not (is_holiday_week or is_push_week):
+            days_worked = 0
+            for i in range(7):
+                dd = ws + timedelta(days=i)
+                # Unify logic: Count worked days via hours > 0
+                if calculate_daily_hours(dd, name, schedule, prev_sched, year, month) > 0:
+                    days_worked += 1
+            if days_worked >= 5: return False
+
+        if not (is_push_week or is_holiday_week):
+             curr_pp_h = pp_hours(name, d)
+             if curr_pp_h + hours_for_role(d, role, hols) > 80: return False
+
+        if role == 'PN' and not strict_mode:
+            pn_counts = [role_counts['PN'][p] + (1 if p == name else 0) for p in config.roster]
+            if (max(pn_counts) - min(pn_counts)) > 1: return False
+        if strict_mode:
+            if role_counts[role][name] >= targets[role][name]: return False
+            if role == "PN" and weekday_sun0(d) == 1 and monday_pn_used[name] >= 1: return False
+            
+        return True
+
+    def score_primary(d, role, name):
+        s = 0.0
+        t = targets[role][name]
+        c = role_counts[role][name]
+        s += (t - c) * 50.0 
+        if role == "PN" and weekday_sun0(d) == 1 and monday_pn_used[name] >= 1: s -= 500.0
+        s -= total_hours[name] * 2.0
+        s -= pp_hours(name, d) * 1.0
+        if role == "PN": s -= pn_weekday_counts[name][weekday_sun0(d)] * 10.0
+        return s + rng.random()
+
+    def can_bu(d, role, p):
+        if d in hols: return False
+        if p in cons.hard_off.get(d, set()): return False
+        if p in schedule[d.isoformat()].values(): return False
+        if role == 'BU1' and enforce_bu1_cap and bu_targets.get('BU1', {}).get(p, 0) > 0 and bu_counts['BU1'][p] >= bu_targets['BU1'][p]: return False
+        # No consecutive Saturdays with role-aware rules
+        if not no_consecutive_saturday_ok(p, d, role): return False
+        # Push week relaxation: consecutive-days cap not enforced during push week
+
+        ws = week_start_sun(d)
+        is_push = week_contains_push(ws)
+        before, after = consecutive_span(p, d)
+        if (not is_push) and (before + 1 + after) > config.max_consecutive_days: return False
+        is_hol = week_contains_holiday(ws)
+        
+        if not (is_push or is_hol):
+             wh = week_hours(p, d)
+             if wh + 8 > 40: return False
+             days_w = 0
+             for i in range(7):
+                 dd = ws + timedelta(days=i)
+                 if calculate_daily_hours(dd, p, schedule, prev_sched, year, month) > 0:
+                     days_w += 1
+             if days_w >= 5: return False
+        
+        if not (is_push or is_hol):
+             if pp_hours(p, d) + 8 > 80: return False
+
+        return True
+
+    def run_solver(strict_mode: bool) -> bool:
+        sundays = [d for d in days if is_sunday(d) and d not in hols]
+        month_sunday_count = {p: 0 for p in config.roster}
+
+        # 6-week rolling Sunday PN rotation across months, driven by actual prior schedules
+        # This continues from the last actual Sunday PN in prev_sched, so manual edits are respected.
+        from collections import deque
+        recent_sundays = deque(maxlen=len(config.roster))
+        prev_pn = None
+        # Collect up to N most recent Sunday PN assignees from prev month schedule
+        for x in sorted(prev_sched.keys(), reverse=True):
+            xd = datetime.strptime(x, '%Y-%m-%d').date()
+            if not is_sunday(xd):
+                continue
+            r_raw = prev_sched.get(x, {}).get('PN')
+            r_norm = norm_name(r_raw)
+            r = roster_map.get(r_norm)
+            if r:
+                if prev_pn is None:
+                    prev_pn = r
+                recent_sundays.appendleft(r)
+                if len(recent_sundays) >= len(config.roster):
+                    break
+
+        start_idx = 0
+        if prev_pn:
+            start_idx = (config.roster.index(prev_pn) + 1) % len(config.roster)
+        rot_idx = start_idx
+
+        for sd in sundays:
+            assigned_sunday = False
+            recent_set = set(recent_sundays)
+            # Three-pass selection:
+            #   A) strict rotation + no month duplicate
+            #   B) relaxed rotation + no month duplicate
+            #   C) relaxed rotation + allow month duplicate (last resort)
+            for allow_recent, allow_month_dup in ((False, False), (True, False), (True, True)):
+                for offset in range(len(config.roster)):
+                    who = config.roster[(rot_idx + offset) % len(config.roster)]
+                    if (not allow_recent) and (who in recent_set):
+                        continue
+                    if (not allow_month_dup) and month_sunday_count[who] >= 1:
+                        continue
+                    if who in cons.hard_off.get(sd, set()):
+                        continue
+                    if strict_mode and role_counts['PN'][who] >= targets['PN'][who]:
+                        continue
+                    if not can_assign_primary(sd, 'PN', who, strict_mode=strict_mode):
+                        continue
+
+                    # Pairing guard: require Sat AN to match this Sun PN (including cross-month boundary),
+                    # except when Saturday is a holiday/observed holiday or Sunday PN is hard-off on Saturday.
+                    sat = sd - timedelta(days=1)
+                    sat_hols = observed_holidays_for_year(sat.year)
+                    if sat in sat_hols or sat in hols:
+                        pass
+                    elif who in cons.hard_off.get(sat, set()):
+                        pass
+                    elif sat.month == month:
+                        if not can_assign_primary(sat, 'AN', who, strict_mode=strict_mode):
+                            continue
+                    else:
+                        prev_roles = prev_sched.get(sat.isoformat(), {})
+                        prev_an_raw = prev_roles.get('AN')
+                        if prev_an_raw is None or str(prev_an_raw).strip() == '':
+                            pass
+                        else:
+                            prev_an_norm = norm_name(prev_an_raw)
+                            prev_an_canon = roster_map.get(prev_an_norm)
+                            if prev_an_canon and prev_an_canon != who:
+                                continue
+
+                    # Assign Sunday PN
+                    schedule[sd.isoformat()]['PN'] = who
+                    role_counts['PN'][who] += 1
+                    total_hours[who] += 5
+                    invalidate_hours_caches(who, sd)
+                    pn_weekday_counts[who][0] += 1
+                    month_sunday_count[who] += 1
+                    assigned_sunday = True
+                    # Advance rotation based on actual assignment
+                    rot_idx = (config.roster.index(who) + 1) % len(config.roster)
+                    recent_sundays.append(who)
+
+                    # If Saturday is in-month and open, assign Sat AN to match Sunday PN
+                    sat = sd - timedelta(days=1)
+                    sat_hols = observed_holidays_for_year(sat.year)
+                    if sat.month == month and sat not in hols and sat not in sat_hols:
+                        if can_assign_primary(sat, 'AN', who, strict_mode=strict_mode):
+                            schedule[sat.isoformat()]['AN'] = who
+                            role_counts['AN'][who] += 1
+                            total_hours[who] += 8
+                            invalidate_hours_caches(who, sat)
+                    break
+                if assigned_sunday:
+                    break
+            if not assigned_sunday and strict_mode:
+                return False
+
+        has_sunday_dupes = any(cnt > 1 for cnt in month_sunday_count.values())
+        if strict_mode and has_sunday_dupes:
+            return False
+
+
+        primary_slots = []
+        role_rank = {'PN': 0, 'AN': 1, 'W': 2}
+        for d in days:
+            req = roles_required_for_day(d, hols)
+            for r in ["PN", "AN", "W"]:
+                if r in req and r not in schedule[d.isoformat()]:
+                    primary_slots.append((d, r))
+        primary_slots.sort(key=lambda s: (day_difficulty.get(s[0], (0, 0, 99, 0, s[0])), role_rank[s[1]]))
+        
+        def count_candidates(slot):
+            d, r = slot
+            return sum(1 for n in config.roster if can_assign_primary(d, r, n, strict_mode))
+
+        def backtrack(slots_left):
+            if not slots_left: return True
+            
+            best_slot = min(
+                slots_left,
+                key=lambda s: (
+                    count_candidates(s),
+                    day_difficulty.get(s[0], (0, 0, 99, 0, s[0])),
+                    role_rank[s[1]],
+                ),
+            )
+            d, role = best_slot
+            remaining_slots = [s for s in slots_left if s != best_slot]
+            
+            cands = [n for n in config.roster if can_assign_primary(d, role, n, strict_mode)]
+            rng.shuffle(cands)
+            cands.sort(key=lambda n: score_primary(d, role, n), reverse=True)
+            
+            for p in cands:
+                schedule[d.isoformat()][role] = p
+                role_counts[role][p] += 1
+                hrs = hours_for_role(d, role, hols)
+                total_hours[p] += hrs
+                invalidate_hours_caches(p, d)
+                if role == "PN":
+                    wd = weekday_sun0(d)
+                    pn_weekday_counts[p][wd] += 1
+                    if wd == 1: monday_pn_used[p] += 1
+                
+                if backtrack(remaining_slots): return True
+                
+                del schedule[d.isoformat()][role]
+                role_counts[role][p] -= 1
+                total_hours[p] -= hrs
+                invalidate_hours_caches(p, d)
+                if role == "PN":
+                    wd = weekday_sun0(d)
+                    pn_weekday_counts[p][wd] -= 1
+                    if wd == 1: monday_pn_used[p] -= 1
+            
+            return False
+
+        return backtrack(primary_slots)
+
+    print("Attempting STRICT solve (Pass 1)...")
+    reset_state()
+    if not run_solver(strict_mode=True):
+        print(">> Strict solve failed. Switching to RELAXED solve (Pass 2)...")
+        reset_state()
+        if not run_solver(strict_mode=False):
+            raise RuntimeError("❌ Solver failed even in relaxed mode. Constraints are too tight.")
+        else:
+            print(">> Relaxed solve successful.")
+    else:
+        print(">> Strict solve successful.")
+
+    def saturday_fairness_pass(stage_label: str) -> Tuple[int, int]:
+        moves = 0
+
+        def counts_with_roster() -> Dict[str, int]:
+            return saturday_work_counts(schedule, year, month, hols, config.roster)
+
+        def recompute_primary_counters_from_schedule() -> None:
+            for role_name in ("PN", "AN", "W"):
+                for person in config.roster:
+                    role_counts[role_name][person] = 0
+            for person in config.roster:
+                for wd in range(7):
+                    pn_weekday_counts[person][wd] = 0
+                monday_pn_used[person] = 0
+                total_hours[person] = 0
+
+            for dd in days:
+                d_iso = dd.isoformat()
+                day_roles = schedule.get(d_iso, {})
+                for role_name in ("PN", "AN", "W"):
+                    person = day_roles.get(role_name)
+                    if not person:
+                        continue
+                    role_counts[role_name][person] += 1
+                    hrs = hours_for_role(dd, role_name, hols)
+                    total_hours[person] += hrs
+                    if role_name == "PN":
+                        wd = weekday_sun0(dd)
+                        pn_weekday_counts[person][wd] += 1
+                        if wd == 1:
+                            monday_pn_used[person] += 1
+
+            try:
+                tracked_bu_counts = bu_counts
+            except NameError:
+                tracked_bu_counts = {}
+            for role_name in tracked_bu_counts:
+                for person in config.roster:
+                    total_hours[person] += tracked_bu_counts[role_name][person] * 8
+
+        while True:
+            counts = counts_with_roster()
+            spread = saturday_spread(counts)
+            if spread <= 1:
+                print(f"Saturday fairness ({stage_label}): moves={moves}, spread={spread}")
+                return moves, spread
+
+            max_c = max(counts.values())
+            min_c = min(counts.values())
+            hi_people = [p for p in config.roster if counts.get(p, 0) == max_c]
+            lo_people = [p for p in config.roster if counts.get(p, 0) == min_c]
+            moved = False
+
+            for hi in hi_people:
+                for d in days:
+                    d_iso = d.isoformat()
+                    if not is_saturday(d) or d in hols:
+                        continue
+                    if schedule[d_iso].get("PN") != hi:
+                        continue
+                    for lo in lo_people:
+                        if lo == hi:
+                            continue
+                        if lo in schedule[d_iso].values():
+                            continue
+                        if lo in cons.hard_off.get(d, set()):
+                            continue
+                        if not no_consecutive_saturday_ok(lo, d, "PN"):
+                            continue
+                        if not can_assign_primary(d, "PN", lo, strict_mode=False):
+                            continue
+
+                        schedule[d_iso]["PN"] = lo
+                        role_counts["PN"][hi] -= 1
+                        role_counts["PN"][lo] += 1
+                        hrs = hours_for_role(d, "PN", hols)
+                        total_hours[hi] -= hrs
+                        total_hours[lo] += hrs
+                        invalidate_hours_caches(hi, d)
+                        invalidate_hours_caches(lo, d)
+                        wd = weekday_sun0(d)
+                        pn_weekday_counts[hi][wd] -= 1
+                        pn_weekday_counts[lo][wd] += 1
+                        if wd == 1:
+                            monday_pn_used[hi] -= 1
+                            monday_pn_used[lo] += 1
+                        moves += 1
+                        moved = True
+                        break
+                    if moved:
+                        break
+                if moved:
+                    break
+
+            if moved:
+                continue
+
+            weekend_pairs: List[Tuple[date, str]] = []
+            for sat in days:
+                if not is_saturday(sat) or sat in hols:
+                    continue
+                sun = sat + timedelta(days=1)
+                if not (sun.year == year and sun.month == month):
+                    continue
+                sat_an = schedule.get(sat.isoformat(), {}).get("AN")
+                sun_pn = schedule.get(sun.isoformat(), {}).get("PN")
+                if sat_an and sun_pn and sat_an == sun_pn:
+                    weekend_pairs.append((sat, sat_an))
+
+            for i in range(len(weekend_pairs)):
+                sat_a, person_a = weekend_pairs[i]
+                if person_a not in hi_people:
+                    continue
+                sun_a = sat_a + timedelta(days=1)
+                for j in range(len(weekend_pairs)):
+                    if i == j:
+                        continue
+                    sat_b, person_b = weekend_pairs[j]
+                    if person_b not in lo_people:
+                        continue
+                    sun_b = sat_b + timedelta(days=1)
+
+                    sat_a_iso, sun_a_iso = sat_a.isoformat(), sun_a.isoformat()
+                    sat_b_iso, sun_b_iso = sat_b.isoformat(), sun_b.isoformat()
+
+                    orig_sat_a_an = schedule[sat_a_iso].get("AN")
+                    orig_sun_a_pn = schedule[sun_a_iso].get("PN")
+                    orig_sat_b_an = schedule[sat_b_iso].get("AN")
+                    orig_sun_b_pn = schedule[sun_b_iso].get("PN")
+
+                    schedule[sat_a_iso].pop("AN", None)
+                    schedule[sat_b_iso].pop("AN", None)
+                    schedule[sun_a_iso].pop("PN", None)
+                    schedule[sun_b_iso].pop("PN", None)
+                    invalidate_hours_caches(person_a, sat_a)
+                    invalidate_hours_caches(person_a, sun_a)
+                    invalidate_hours_caches(person_b, sat_b)
+                    invalidate_hours_caches(person_b, sun_b)
+
+                    feasible = (
+                        no_consecutive_saturday_ok(person_b, sat_a, "AN")
+                        and no_consecutive_saturday_ok(person_a, sat_b, "AN")
+                        and can_assign_primary(sat_a, "AN", person_b, strict_mode=False)
+                        and can_assign_primary(sun_a, "PN", person_b, strict_mode=False)
+                        and can_assign_primary(sat_b, "AN", person_a, strict_mode=False)
+                        and can_assign_primary(sun_b, "PN", person_a, strict_mode=False)
+                    )
+
+                    if feasible:
+                        schedule[sat_a_iso]["AN"] = person_b
+                        schedule[sun_a_iso]["PN"] = person_b
+                        schedule[sat_b_iso]["AN"] = person_a
+                        schedule[sun_b_iso]["PN"] = person_a
+                        invalidate_hours_caches(person_b, sat_a)
+                        invalidate_hours_caches(person_b, sun_a)
+                        invalidate_hours_caches(person_a, sat_b)
+                        invalidate_hours_caches(person_a, sun_b)
+                        recompute_primary_counters_from_schedule()
+
+                        moves += 1
+                        moved = True
+                    else:
+                        if orig_sat_a_an:
+                            schedule[sat_a_iso]["AN"] = orig_sat_a_an
+                            invalidate_hours_caches(orig_sat_a_an, sat_a)
+                        if orig_sun_a_pn:
+                            schedule[sun_a_iso]["PN"] = orig_sun_a_pn
+                            invalidate_hours_caches(orig_sun_a_pn, sun_a)
+                        if orig_sat_b_an:
+                            schedule[sat_b_iso]["AN"] = orig_sat_b_an
+                            invalidate_hours_caches(orig_sat_b_an, sat_b)
+                        if orig_sun_b_pn:
+                            schedule[sun_b_iso]["PN"] = orig_sun_b_pn
+                            invalidate_hours_caches(orig_sun_b_pn, sun_b)
+
+                    if moved:
+                        break
+                if moved:
+                    break
+
+            if moved:
+                continue
+
+            if stage_label == "post-bu":
+                push_days = get_push_days_for_month(year, month)
+                for hi in hi_people:
+                    for d in days:
+                        if not is_saturday(d) or d in hols or d not in push_days:
+                            continue
+                        d_iso = d.isoformat()
+                        for role in ("BU1", "BU2", "BU3", "BU4"):
+                            if schedule[d_iso].get(role) != hi:
+                                continue
+                            for lo in lo_people:
+                                if lo == hi:
+                                    continue
+                                if lo in schedule[d_iso].values():
+                                    continue
+                                if lo in cons.hard_off.get(d, set()):
+                                    continue
+                                if not no_consecutive_saturday_ok(lo, d, role):
+                                    continue
+                                if not can_bu(d, role, lo):
+                                    continue
+                                schedule[d_iso][role] = lo
+                                remove_bu_count(d, role, hi)
+                                add_bu_count(d, role, lo)
+                                total_hours[hi] -= 8
+                                total_hours[lo] += 8
+                                invalidate_hours_caches(hi, d)
+                                invalidate_hours_caches(lo, d)
+                                moves += 1
+                                moved = True
+                                break
+                            if moved:
+                                break
+                        if moved:
+                            break
+                    if moved:
+                        break
+
+            if not moved:
+                final_spread = saturday_spread(counts_with_roster())
+                print(f"Saturday fairness ({stage_label}): moves={moves}, spread={final_spread}")
+                return moves, final_spread
+
+    saturday_fairness_pass("post-primaries")
+
+    
+    roster_size = len(config.roster)
+    bu_roles_present = sorted({role for d in days for role in ideal_bu_roles_for_day(d, roster_size)})
+    bu_opps = {role: 0 for role in bu_roles_present}
+    for _d in days:
+        for role in ideal_bu_roles_for_day(_d, roster_size):
+            bu_opps[role] += 1
+
+    bu_targets = {role: {p: 0 for p in config.roster} for role in bu_roles_present}
+    roster_set = set(config.roster)
+    base_order = [x for x in config.sales_order if x in roster_set] + [x for x in config.roster if x not in config.sales_order]
+    bu1_priority_order = [p for p in primary_priority_order if p in roster_set]
+    bu_cursor = primary_remainder_cursor
+    for role in bu_roles_present:
+        opps = bu_opps[role]
+        if opps <= 0:
+            continue
+        if role == "BU1":
+            role_targets, bu_cursor = distribute_with_cursor(bu1_priority_order, opps, len(config.roster), bu_cursor)
+            for p in config.roster:
+                bu_targets[role][p] = role_targets[p]
+            continue
+
+        base = opps // len(config.roster)
+        rem = opps % len(config.roster)
+        for p in config.roster:
+            bu_targets[role][p] = base
+        for i in range(rem):
+            bu_targets[role][base_order[i]] += 1
+
+    bu_counts = {role: {p: 0 for p in config.roster} for role in bu_roles_present}
+    bu_weekday_counts = {role: {p: {i: 0 for i in range(7)} for p in config.roster} for role in bu_roles_present}
+    primary_counts_total = {p: sum(role_counts[r][p] for r in ("PN", "AN", "W")) for p in config.roster}
+    enforce_bu1_cap = True
+
+    def combined_total_for(person: str) -> int:
+        return primary_counts_total[person] + bu_counts.get("BU1", {}).get(person, 0)
+
+    def add_bu_count(d: date, role: str, person: str):
+        if role not in bu_counts:
+            return
+        bu_counts[role][person] += 1
+        bu_weekday_counts[role][person][weekday_sun0(d)] += 1
+
+    def remove_bu_count(d: date, role: str, person: str):
+        if role not in bu_counts:
+            return
+        bu_counts[role][person] = max(0, bu_counts[role][person] - 1)
+        wd = weekday_sun0(d)
+        bu_weekday_counts[role][person][wd] = max(0, bu_weekday_counts[role][person][wd] - 1)
+
+    # --- BU FILL ---
+    BU_ROLE_RANK = {"BU1": 1, "BU2": 2, "BU3": 3, "BU4": 4}
+    bu_queue = []
+    for d in days:
+        ideal = ideal_bu_roles_for_day(d, roster_size)
+        if not ideal:
+            continue
+
+        for rname in ideal:
+            cands = [p for p in config.roster if can_bu(d, rname, p)]
+            if not cands:
+                break
+            bu_queue.append((d, rname))
+
+    cand_count = {
+        (d, role): sum(1 for p in config.roster if can_bu(d, role, p))
+        for (d, role) in bu_queue
+    }
+    bu_queue.sort(key=lambda item: (
+        cand_count[item],
+        item[0],
+        BU_ROLE_RANK.get(item[1], 99),
+    ))
+
+    def bu_score(d, role, p, min_combined: Optional[int] = None):
+        s = rng.random()
+        s -= total_hours[p] * 0.5
+        s -= pp_hours(p, d) * 1.0
+        if role in bu_targets:
+            deficit_weight = 60.0 if role == 'BU1' else 50.0
+            s += (bu_targets[role][p] - bu_counts[role][p]) * deficit_weight
+            s -= bu_weekday_counts[role][p][weekday_sun0(d)] * 10.0
+        if role == 'BU1':
+            person_combined = combined_total_for(p)
+            effective_min_combined = min_combined
+            if effective_min_combined is None:
+                effective_min_combined = min(combined_total_for(person) for person in config.roster)
+            s -= (person_combined - effective_min_combined) * 45.0
+            if person_combined > effective_min_combined + 1:
+                s -= 500.0 + (person_combined - (effective_min_combined + 1)) * 200.0
+            # extra spread on Mondays (avoid the same BU1 on Mondays)
+            if weekday_sun0(d) == 1:
+                s -= bu_weekday_counts['BU1'][p][1] * 25.0
+        if p in cons.avoid_roles.get((d, role), set()): s -= 1000.0
+        # Soft B2B preference for BU: discourage repeats but NEVER block filling BU.
+        prev_d = d - timedelta(days=1)
+        prev_roles = schedule.get(prev_d.isoformat(), {})
+        if prev_d.month != month:
+            prev_roles = prev_sched.get(prev_d.isoformat(), {})
+        had_any_bu_yday = any(k.startswith('BU') and v == p for k, v in prev_roles.items())
+        had_same_bu_slot_yday = (prev_roles.get(role) == p)
+        if had_any_bu_yday:
+            s -= 5.0   # small nudge away from consecutive BU days
+        if had_same_bu_slot_yday:
+            s -= 10.0  # safety nudge if can_bu rules are ever relaxed again
+        return s
+
+    def solve_bu(idx):
+        if idx >= len(bu_queue): return True
+        d, role = bu_queue[idx]
+        cands = [p for p in config.roster if can_bu(d, role, p)]
+        rng.shuffle(cands)
+        min_combined = None
+        if role == "BU1":
+            min_combined = min(combined_total_for(person) for person in config.roster)
+        cands.sort(key=lambda p: bu_score(d, role, p, min_combined=min_combined), reverse=True)
+        
+        for p in cands:
+            schedule[d.isoformat()][role] = p
+            total_hours[p] += 8
+            add_bu_count(d, role, p)
+            invalidate_hours_caches(p, d)
+
+            if solve_bu(idx + 1):
+                return True
+
+            del schedule[d.isoformat()][role]
+            total_hours[p] -= 8
+            remove_bu_count(d, role, p)
+            invalidate_hours_caches(p, d)
+
+        return False
+
+    bu_fill_success = solve_bu(0)
+    if not bu_fill_success:
+        if enforce_bu1_cap:
+            enforce_bu1_cap = False
+            # Clear existing BU assignments and retry without the BU1 cap (still respects all hour/dayoff rules).
+            for d_iso2 in list(schedule.keys()):
+                for k in ['BU1','BU2','BU3','BU4']:
+                    schedule[d_iso2].pop(k, None)
+            week_hours_cache.clear()
+            pp_hours_cache.clear()
+            for role_name in bu_counts:
+                for p2 in bu_counts[role_name]:
+                    bu_counts[role_name][p2] = 0
+            for role_name in bu_weekday_counts:
+                for p2 in bu_weekday_counts[role_name]:
+                    for wd in bu_weekday_counts[role_name][p2]:
+                        bu_weekday_counts[role_name][p2][wd] = 0
+            bu_fill_success = solve_bu(0)
+            if bu_fill_success:
+                print("BU fill successful after relaxing BU1 cap.")
+            else:
+                print("Warning: Could not fill all desired BU slots.")
+        else:
+            print("Warning: Could not fill all desired BU slots.")
+        if not bu_fill_success:
+            # --- Greedy fallback BU fill (best effort) ---
+            # If full backtracking can't fill every BU slot, keep what we can.
+            for d, role in bu_queue:
+                d_iso = d.isoformat()
+                if role in schedule[d_iso]:
+                    continue
+                cands = [person for person in config.roster if can_bu(d, role, person)]
+                if not cands:
+                    continue
+                min_combined = None
+                if role == "BU1":
+                    min_combined = min(combined_total_for(person) for person in config.roster)
+                cands.sort(key=lambda person: bu_score(d, role, person, min_combined=min_combined), reverse=True)
+                pick = cands[0]
+                schedule[d_iso][role] = pick
+                total_hours[pick] += 8
+                add_bu_count(d, role, pick)
+                invalidate_hours_caches(pick, d)
+            # --- end greedy fallback ---
+
+    # --- BU REPAIR PASS ---
+    bu_repair_swaps = []
+    repair_roles = {"BU2", "BU3"}
+    def next_missing_repair_role(d: date) -> Optional[str]:
+        expected = ideal_bu_roles_for_day(d, roster_size)
+        d_iso = d.isoformat()
+        for role in ("BU1", "BU2", "BU3", "BU4"):
+            if role in expected and role not in schedule[d_iso]:
+                if role in repair_roles:
+                    return role
+                return None
+        return None
+
+    deficits = []
+    for d in days:
+        role = next_missing_repair_role(d)
+        if role is not None:
+            deficits.append((d, role))
+    before_deficits = len(deficits)
+
+    for d, role in deficits:
+        d_iso = d.isoformat()
+        if role in schedule[d_iso]:
+            continue
+
+        ws = week_start_sun(d)
+        is_relaxed_week = week_contains_push(ws) or week_contains_holiday(ws)
+
+        # Easy win first: direct assignment if someone already passes all checks.
+        direct_cands = [p for p in config.roster if can_bu(d, role, p)]
+        if direct_cands:
+            direct_cands.sort(key=lambda person: bu_score(d, role, person), reverse=True)
+            pick = direct_cands[0]
+            schedule[d_iso][role] = pick
+            total_hours[pick] += 8
+            add_bu_count(d, role, pick)
+            invalidate_hours_caches(pick, d)
+            bu_repair_swaps.append({
+                "type": "direct",
+                "deficit_day": d_iso,
+                "deficit_role": role,
+                "assigned": pick,
+            })
+            continue
+
+        if is_relaxed_week:
+            continue
+
+        # Single-swap augmenting attempt (same-week only).
+        week_days = [ws + timedelta(days=i) for i in range(7)]
+
+        fixed = False
+        for p in config.roster:
+            # Candidate for deficit day must be free and not hard-off.
+            if p in schedule[d_iso].values():
+                continue
+            if p in cons.hard_off.get(d, set()):
+                continue
+
+            # Try to free one BU assignment for p inside the same week.
+            move_options = []
+            for d2 in week_days:
+                d2_iso = d2.isoformat()
+                if d2_iso not in schedule:
+                    continue
+                for moved_role in tuple(repair_roles):
+                    if schedule[d2_iso].get(moved_role) == p:
+                        move_options.append((d2, moved_role))
+
+            if not move_options:
+                continue
+
+            for d2, moved_role in move_options:
+                d2_iso = d2.isoformat()
+
+                # Find receiver q for p's moved BU slot.
+                q_cands = []
+                for q in config.roster:
+                    if q == p:
+                        continue
+                    if q in schedule[d2_iso].values():
+                        continue
+                    if q in cons.hard_off.get(d2, set()):
+                        continue
+                    if can_bu(d2, moved_role, q):
+                        q_cands.append(q)
+
+                if not q_cands:
+                    continue
+
+                q_cands.sort(key=lambda person: bu_score(d2, moved_role, person), reverse=True)
+
+                for q in q_cands:
+                    # Tentative move: d2 moved_role from p -> q
+                    schedule[d2_iso][moved_role] = q
+                    total_hours[p] -= 8
+                    total_hours[q] += 8
+                    invalidate_hours_caches(p, d2)
+                    invalidate_hours_caches(q, d2)
+                    remove_bu_count(d2, moved_role, p)
+                    add_bu_count(d2, moved_role, q)
+
+                    # After freeing p's load, try filling deficit.
+                    if can_bu(d, role, p):
+                        schedule[d_iso][role] = p
+                        total_hours[p] += 8
+                        add_bu_count(d, role, p)
+                        invalidate_hours_caches(p, d)
+                        bu_repair_swaps.append({
+                            "type": "swap",
+                            "deficit_day": d_iso,
+                            "deficit_role": role,
+                            "filled_by": p,
+                            "moved_day": d2_iso,
+                            "moved_role": moved_role,
+                            "moved_from": p,
+                            "moved_to": q,
+                        })
+                        fixed = True
+                        break
+
+                    # Rollback tentative move.
+                    schedule[d2_iso][moved_role] = p
+                    total_hours[p] += 8
+                    total_hours[q] -= 8
+                    invalidate_hours_caches(p, d2)
+                    invalidate_hours_caches(q, d2)
+                    remove_bu_count(d2, moved_role, q)
+                    add_bu_count(d2, moved_role, p)
+
+                if fixed:
+                    break
+            if fixed:
+                break
+
+    remaining_deficits = []
+    for d in days:
+        role = next_missing_repair_role(d)
+        if role is not None:
+            remaining_deficits.append((d, role))
+    after_deficits = len(remaining_deficits)
+    print("\n--- BU Repair Pass Summary ---")
+    print(f"{sorted(repair_roles)} deficits before repair: {before_deficits}")
+    print(f"{sorted(repair_roles)} deficits after repair: {after_deficits}")
+    if bu_repair_swaps:
+        for item in bu_repair_swaps:
+            if item["type"] == "direct":
+                print(f"[DIRECT] Filled {item['deficit_role']} on {item['deficit_day']} with {item['assigned']}")
+            else:
+                print(
+                    f"[SWAP] Filled {item['deficit_role']} on {item['deficit_day']} with {item['filled_by']} "
+                    f"by moving {item['moved_role']} on {item['moved_day']} from {item['moved_from']} to {item['moved_to']}"
+                )
+    else:
+        print("No BU repair swaps performed.")
+
+    def compact_bu_for_day(day_iso: str) -> None:
+        rm = schedule.get(day_iso, {})
+        vals = [rm.get("BU1", ""), rm.get("BU2", ""), rm.get("BU3", ""), rm.get("BU4", "")]
+        vals = [v for v in vals if v is not None and str(v).strip() != ""]
+        for k in ("BU1", "BU2", "BU3", "BU4"):
+            rm.pop(k, None)
+        for i, v in enumerate(vals):
+            rm[f"BU{i+1}"] = v
+
+    def normalize_bu1_precedence_all_days():
+        for d in month_days(year, month):
+            expected_roles = ideal_bu_roles_for_day(d, roster_size)
+            if "BU1" not in expected_roles:
+                continue
+            d_iso = d.isoformat()
+            if "BU1" in schedule[d_iso]:
+                continue
+            if "BU2" in schedule[d_iso]:
+                p = schedule[d_iso]["BU2"]
+                schedule[d_iso]["BU1"] = p
+                del schedule[d_iso]["BU2"]
+
+    def weekday_target_repair_pass(
+        schedule,
+        prev_sched,
+        cons,
+        roster,
+        year,
+        month,
+        hols,
+        payperiods,
+        target_weekday_staff=5,
+        verbose=False,
+    ):
+        repair_log = []
+        improved_days = 0
+        moves_performed = 0
+        swap_attempts = 0
+        max_swap_attempts = 200
+        max_attempts_per_day = 25
+
+        def next_missing_expected_bu_role(d: date) -> Optional[str]:
+            expected = ideal_bu_roles_for_day(d, roster_size)
+            d_iso = d.isoformat()
+            for role in ("BU1", "BU2", "BU3", "BU4"):
+                if role in expected and role not in schedule[d_iso]:
+                    return role
+            return None
+
+        def normalize_bu1_skip(d: date):
+            d_iso = d.isoformat()
+            expected_roles = ideal_bu_roles_for_day(d, roster_size)
+            if "BU1" not in expected_roles:
+                return
+            if "BU1" in schedule[d_iso]:
+                return
+            if "BU2" in schedule[d_iso]:
+                p = schedule[d_iso]["BU2"]
+                schedule[d_iso]["BU1"] = p
+                del schedule[d_iso]["BU2"]
+                remove_bu_count(d, "BU2", p)
+                add_bu_count(d, "BU1", p)
+                invalidate_hours_caches(p, d)
+
+        def add_bu1_count(d: date, person: str):
+            add_bu_count(d, "BU1", person)
+
+        def remove_bu1_count(d: date, person: str):
+            remove_bu_count(d, "BU1", person)
+
+        def attempt_primary_swap_to_free_capacity(target_day: date, desired_bu_role: str) -> bool:
+            """
+            Try to enable filling desired_bu_role on target_day by freeing capacity for a candidate
+            via a like-for-like primary swap across two weekday dates (no weekend primaries).
+            Returns True if it successfully performed a swap AND then successfully filled desired_bu_role on target_day.
+            Otherwise returns False and leaves schedule unchanged.
+            """
+            nonlocal moves_performed
+
+            d = target_day
+            d_iso = d.isoformat()
+            assigned_today = set(schedule[d_iso].values())
+            avail = [
+                p for p in roster
+                if p not in assigned_today and p not in cons.hard_off.get(d, set())
+            ]
+
+            ws = week_start_sun(d)
+            week_days = [ws + timedelta(days=i) for i in range(7)]
+
+            def remove_primary_assignment(day: date, role: str, person: str):
+                day_iso = day.isoformat()
+                del schedule[day_iso][role]
+                role_counts[role][person] -= 1
+                total_hours[person] -= hours_for_role(day, role, hols)
+                invalidate_hours_caches(person, day)
+                if role == "PN":
+                    pn_weekday_counts[person][weekday_sun0(day)] -= 1
+                    if weekday_sun0(day) == 1:
+                        monday_pn_used[person] -= 1
+
+            def add_primary_assignment(day: date, role: str, person: str):
+                day_iso = day.isoformat()
+                schedule[day_iso][role] = person
+                role_counts[role][person] += 1
+                total_hours[person] += hours_for_role(day, role, hols)
+                invalidate_hours_caches(person, day)
+                if role == "PN":
+                    pn_weekday_counts[person][weekday_sun0(day)] += 1
+                    if weekday_sun0(day) == 1:
+                        monday_pn_used[person] += 1
+
+            for p in avail:
+                if can_bu(d, desired_bu_role, p):
+                    continue
+
+                for a in week_days:
+                    if a.month != month or not is_weekday(a):
+                        continue
+                    a_iso = a.isoformat()
+
+                    role = None
+                    for r in ("PN", "AN", "W"):
+                        if schedule[a_iso].get(r) == p:
+                            role = r
+                            break
+                    if role is None:
+                        continue
+
+                    # Keep weekend pairing guard intact (safety; weekdays already enforced).
+                    if (is_sunday(a) and role == "PN") or (is_saturday(a) and role == "AN"):
+                        continue
+
+                    for b in days:
+                        if week_start_sun(b) == ws:
+                            continue
+                        if b.month != month or not is_weekday(b):
+                            continue
+                        b_iso = b.isoformat()
+                        q = schedule[b_iso].get(role)
+                        if not q or q == p:
+                            continue
+
+                        if q in schedule[a_iso].values():
+                            continue
+                        if p in schedule[b_iso].values():
+                            continue
+                        if q in cons.hard_off.get(a, set()) or p in cons.hard_off.get(b, set()):
+                            continue
+
+                        remove_primary_assignment(a, role, p)
+                        remove_primary_assignment(b, role, q)
+
+                        feasible = (
+                            can_assign_primary(a, role, q, strict_mode=False)
+                            and can_assign_primary(b, role, p, strict_mode=False)
+                        )
+                        if feasible:
+                            add_primary_assignment(a, role, q)
+                            add_primary_assignment(b, role, p)
+
+                            if can_bu(d, desired_bu_role, p):
+                                schedule[d_iso][desired_bu_role] = p
+                                total_hours[p] += 8
+                                add_bu_count(d, desired_bu_role, p)
+                                invalidate_hours_caches(p, d)
+                                normalize_bu1_skip(d)
+                                moves_performed += 3
+                                if verbose:
+                                    repair_log.append(
+                                        f"primary-swap: swapped {role} on {a_iso} ({p}->{q}) "
+                                        f"with {role} on {b_iso} ({q}->{p}) to free {p} for {desired_bu_role} on {d_iso}"
+                                    )
+                                return True
+
+                            remove_primary_assignment(a, role, q)
+                            remove_primary_assignment(b, role, p)
+
+                        add_primary_assignment(a, role, p)
+                        add_primary_assignment(b, role, q)
+                        # continue loop to try next p
+
+            # AFTER the loop completes:
+            if verbose:
+                repair_log.append(
+                    f"primary-swap: no feasible primary swap found to free capacity for {desired_bu_role} on {d_iso}"
+                )
+            return False
+
+        for d in month_days(year, month):
+            if d in hols or not is_weekday(d):
+                continue
+            attempts_for_day = 0
+            available_count = len(roster) - len(cons.hard_off.get(d, set()))
+            if available_count < target_weekday_staff:
+                continue
+
+            d_iso = d.isoformat()
+            if unique_assignee_count(schedule[d_iso]) >= target_weekday_staff:
+                continue
+            day_improved = False
+            day_stop_reason: Optional[str] = None
+            while unique_assignee_count(schedule[d_iso]) < target_weekday_staff:
+                if attempts_for_day >= max_attempts_per_day:
+                    day_stop_reason = f"day {d_iso}: stopped; reached max attempts ({max_attempts_per_day})"
+                    break
+
+                normalize_bu1_skip(d)
+                desired_role = next_missing_expected_bu_role(d)
+                if desired_role is None:
+                    break
+                attempts_for_day += 1
+
+                pre_unique = unique_assignee_count(schedule[d_iso])
+                assigned_today = set(schedule[d_iso].values())
+                available_today = [
+                    p for p in roster
+                    if p not in cons.hard_off.get(d, set()) and p not in assigned_today
+                ]
+                if not available_today:
+                    day_stop_reason = (
+                        f"day {d_iso}: stopped; no available candidates for {desired_role}"
+                    )
+                    break
+
+                direct_success = False
+                direct_cands = [p for p in available_today if can_bu(d, desired_role, p)]
+                if direct_cands:
+                    direct_cands.sort(key=lambda person: bu_score(d, desired_role, person), reverse=True)
+                    pick = direct_cands[0]
+                    schedule[d_iso][desired_role] = pick
+                    total_hours[pick] += 8
+                    add_bu_count(d, desired_role, pick)
+                    invalidate_hours_caches(pick, d)
+                    normalize_bu1_skip(d)
+                    post_unique = unique_assignee_count(schedule[d_iso])
+                    if post_unique > pre_unique:
+                        day_improved = True
+                    moves_performed += 1
+                    action_msg = (
+                        f"direct: assigned {pick} to {desired_role} on {d_iso} ({pre_unique}->{post_unique})"
+                    )
+                    if verbose:
+                        action_msg += f" [available_today={len(available_today)} attempts={attempts_for_day}]"
+                    repair_log.append(action_msg)
+                    direct_success = True
+
+                if direct_success:
+                    continue
+
+                ws = week_start_sun(d)
+                week_days = [ws + timedelta(days=i) for i in range(7)]
+                fixed = False
+                for x in available_today:
+                    if fixed:
+                        break
+                    move_options = []
+                    for d2 in week_days:
+                        d2_iso = d2.isoformat()
+                        if d2_iso not in schedule:
+                            continue
+                        for r2 in ("BU3", "BU2", "BU4", "BU1"):
+                            if schedule[d2_iso].get(r2) == x:
+                                move_options.append((d2, r2))
+
+                    for d2, r2 in move_options:
+                        if swap_attempts >= max_swap_attempts or attempts_for_day >= max_attempts_per_day:
+                            break
+                        d2_iso = d2.isoformat()
+                        y_cands = []
+                        for y in roster:
+                            if y == x:
+                                continue
+                            if y in schedule[d2_iso].values():
+                                continue
+                            if y in cons.hard_off.get(d2, set()):
+                                continue
+                            if can_bu(d2, r2, y):
+                                y_cands.append(y)
+
+                        y_cands.sort(key=lambda person: bu_score(d2, r2, person), reverse=True)
+                        for y in y_cands:
+                            if swap_attempts >= max_swap_attempts or attempts_for_day >= max_attempts_per_day:
+                                break
+                            swap_attempts += 1
+                            attempts_for_day += 1
+                            schedule[d2_iso][r2] = y
+                            total_hours[x] -= 8
+                            total_hours[y] += 8
+                            invalidate_hours_caches(x, d2)
+                            invalidate_hours_caches(y, d2)
+                            remove_bu_count(d2, r2, x)
+                            add_bu_count(d2, r2, y)
+
+                            if can_bu(d, desired_role, x):
+                                schedule[d_iso][desired_role] = x
+                                total_hours[x] += 8
+                                add_bu_count(d, desired_role, x)
+                                invalidate_hours_caches(x, d)
+                                normalize_bu1_skip(d)
+                                post_unique = unique_assignee_count(schedule[d_iso])
+                                if post_unique > pre_unique:
+                                    day_improved = True
+                                moves_performed += 2
+                                action_msg = (
+                                    f"swap: moved {r2} on {d2_iso} from {x} -> {y} to free {x} for {desired_role} on {d_iso} ({pre_unique}->{post_unique})"
+                                )
+                                if verbose:
+                                    action_msg += f" [attempts_for_day={attempts_for_day} total_attempts={swap_attempts}]"
+                                repair_log.append(action_msg)
+                                fixed = True
+                                break
+
+                            schedule[d2_iso][r2] = x
+                            total_hours[x] += 8
+                            total_hours[y] -= 8
+                            invalidate_hours_caches(x, d2)
+                            invalidate_hours_caches(y, d2)
+                            remove_bu_count(d2, r2, y)
+                            add_bu_count(d2, r2, x)
+
+                        if fixed:
+                            break
+
+                    if swap_attempts >= max_swap_attempts or attempts_for_day >= max_attempts_per_day:
+                        break
+
+                if fixed:
+                    continue
+
+                if config.enable_primary_swap_repair:
+                    pre_swap_unique = unique_assignee_count(schedule[d_iso])
+                    swapped = attempt_primary_swap_to_free_capacity(d, desired_role)
+                    if swapped:
+                        post_swap_unique = unique_assignee_count(schedule[d_iso])
+                        if post_swap_unique > pre_swap_unique:
+                            day_improved = True
+                        continue
+
+                day_stop_reason = (
+                    f"day {d_iso}: stopped; no feasible {desired_role} candidate under constraints"
+                )
+                break
+
+            if day_improved:
+                improved_days += 1
+
+            if verbose and day_stop_reason:
+                repair_log.append(day_stop_reason)
+
+        summary = {
+            "improved_days": improved_days,
+            "moves_performed": moves_performed,
+            "log": repair_log,
+        }
+        return schedule, summary
+
+    if config.enable_weekday_target_repair:
+        schedule, repair_log = weekday_target_repair_pass(
+            schedule=schedule,
+            prev_sched=prev_sched,
+            cons=cons,
+            roster=config.roster,
+            year=year,
+            month=month,
+            hols=hols,
+            payperiods=payperiods,
+            target_weekday_staff=config.target_weekday_staff,
+            verbose=config.weekday_target_repair_verbose,
+        )
+        print(
+            "\n--- Weekday Target Repair Summary ---\n"
+            f"Weekdays improved: {repair_log['improved_days']}\n"
+            f"BU moves performed: {repair_log['moves_performed']}"
+        )
+        if config.weekday_target_repair_verbose and repair_log["log"]:
+            for action in repair_log["log"][:10]:
+                print(f"[weekday-target-repair] {action}")
+
+    def balance_bu1_delta_pass() -> Tuple[int, int]:
+        nonlocal enforce_bu1_cap
+        bu1_swaps = 0
+
+        def combined_counts() -> Dict[str, int]:
+            return {p: primary_counts_total[p] + bu_counts.get("BU1", {}).get(p, 0) for p in config.roster}
+
+        prev_enforce = enforce_bu1_cap
+        enforce_bu1_cap = False
+        try:
+            while True:
+                combined = combined_counts()
+                min_v = min(combined.values())
+                max_v = max(combined.values())
+                if max_v - min_v <= 1:
+                    final_spread = max_v - min_v
+                    print(f"BU1 balance: swaps={bu1_swaps}, final combined spread={final_spread}")
+                    return bu1_swaps, final_spread
+
+                hi_people = [p for p in config.roster if combined[p] == max_v]
+                lo_people = [p for p in config.roster if combined[p] == min_v]
+                moved = False
+
+                for hi in hi_people:
+                    for lo in lo_people:
+                        for d in days:
+                            d_iso = d.isoformat()
+                            if schedule[d_iso].get("BU1") != hi:
+                                continue
+                            if lo in schedule[d_iso].values():
+                                continue
+                            if not can_bu(d, "BU1", lo):
+                                continue
+
+                            schedule[d_iso]["BU1"] = lo
+                            remove_bu_count(d, "BU1", hi)
+                            add_bu_count(d, "BU1", lo)
+                            total_hours[hi] -= 8
+                            total_hours[lo] += 8
+                            invalidate_hours_caches(hi, d)
+                            invalidate_hours_caches(lo, d)
+
+                            bu1_swaps += 1
+                            moved = True
+                            break
+                        if moved:
+                            break
+                    if moved:
+                        break
+
+                if not moved:
+                    final_combined = combined_counts()
+                    final_spread = max(final_combined.values()) - min(final_combined.values())
+                    print(f"BU1 balance: swaps={bu1_swaps}, final combined spread={final_spread}")
+                    return bu1_swaps, final_spread
+        finally:
+            enforce_bu1_cap = prev_enforce
+
+    # ALWAYS enforce BU1 precedence after all BU work (regardless of repair flag).
+    normalize_bu1_precedence_all_days()
+    bu1_balance_swaps, final_combined_spread = balance_bu1_delta_pass()
+    normalize_bu1_precedence_all_days()
+
+    for d in days:
+        if d in hols or is_sunday(d):
+            continue
+        compact_bu_for_day(d.isoformat())
+
+    saturday_fairness_pass("post-bu")
+
+    def pn_sales_rank_preference_pass() -> int:
+        """
+        Best-effort pass: Try to reduce PN inversions vs sales priority order
+        WITHOUT touching Sundays or Saturdays.
+        Returns number of PN moves performed.
+        """
+        roster_set_local = set(config.roster)
+        pn_priority = [p for p in config.sales_order if p in roster_set_local]
+        pn_priority += [p for p in config.roster if p not in pn_priority]
+        priority_idx = {p: i for i, p in enumerate(pn_priority)}
+        max_attempts = 50
+        attempts = 0
+        moves = 0
+
+        while attempts < max_attempts:
+            attempts += 1
+            pn_counts = {p: role_counts["PN"][p] for p in config.roster}
+            inversion_found = False
+            move_made = False
+
+            for hi in pn_priority:
+                for lo in pn_priority:
+                    if priority_idx[hi] >= priority_idx[lo]:
+                        continue
+                    if pn_counts[hi] >= pn_counts[lo]:
+                        continue
+
+                    inversion_found = True
+                    transferred = False
+                    for d in days:
+                        if not is_weekday(d):
+                            continue
+                        if d in hols:
+                            continue
+                        d_iso = d.isoformat()
+                        if schedule[d_iso].get("PN") != lo:
+                            continue
+                        if hi in schedule[d_iso].values():
+                            continue
+                        if hi in cons.hard_off.get(d, set()):
+                            continue
+
+                        schedule[d_iso].pop("PN", None)
+                        hrs = hours_for_role(d, "PN", hols)
+                        wd = weekday_sun0(d)
+                        role_counts["PN"][lo] -= 1
+                        total_hours[lo] -= hrs
+                        pn_weekday_counts[lo][wd] -= 1
+                        if wd == 1:
+                            monday_pn_used[lo] = max(0, monday_pn_used[lo] - 1)
+                        invalidate_hours_caches(lo, d)
+                        feasible = can_assign_primary(d, "PN", hi, strict_mode=False)
+                        if feasible:
+                            schedule[d_iso]["PN"] = hi
+                            role_counts["PN"][hi] += 1
+                            total_hours[hi] += hrs
+                            pn_weekday_counts[hi][wd] += 1
+                            if wd == 1:
+                                monday_pn_used[hi] += 1
+                            invalidate_hours_caches(hi, d)
+                            invalidate_hours_caches(lo, d)
+                            moves += 1
+                            move_made = True
+                            transferred = True
+                        else:
+                            role_counts["PN"][lo] += 1
+                            total_hours[lo] += hrs
+                            pn_weekday_counts[lo][wd] += 1
+                            if wd == 1:
+                                monday_pn_used[lo] += 1
+                            schedule[d_iso]["PN"] = lo
+                            invalidate_hours_caches(lo, d)
+
+                        if transferred:
+                            break
+
+                    if transferred:
+                        break
+                if move_made:
+                    break
+
+            if not inversion_found or not move_made:
+                break
+
+        print(f"PN sales-rank preference: moves={moves}")
+        return moves
+
+    pn_sales_rank_preference_pass()
+
+    # print("Warning: Could not fill all desired BU slots.")
+    print("\n--- Schedule Fairness Audit ---")
+    print(f"{'Name':<10} {'PN (Tgt)':<10} {'AN':<5} {'W':<5} {'TotHrs':<8}")
+    for p in config.roster:
+        pn = role_counts["PN"][p]
+        an = role_counts["AN"][p]
+        w = role_counts["W"][p]
+        tgt = targets["PN"][p]
+        print(f"{p:<10} {pn} ({tgt})      {an:<5} {w:<5} {total_hours[p]:<8}")
+
+    return schedule
+
+
+def validate_min_weekday_staff(
+    schedule: Dict[str, Dict[str, str]],
+    year: int,
+    month: int,
+    hols: Set[date],
+    roster: List[str],
+    cons: Constraints,
+    min_staff: int = 4,
+) -> Tuple[bool, str]:
+    """Validate minimum unique weekday staffing coverage for the built schedule."""
+    for day in month_days(year, month):
+        if day in hols or not is_weekday(day):
+            continue
+
+        day_key = day.isoformat()
+        day_roles = schedule.get(day_key, {})
+        assigned_people = unique_assignees(day_roles.values())
+        available_count = len(roster) - len(cons.hard_off.get(day, set()))
+        effective_min = min(min_staff, available_count)
+        if len(assigned_people) < effective_min:
+            return (
+                False,
+                f"Weekday understaffed: {day_key} has {len(assigned_people)} unique people (<{effective_min}, desired={min_staff}, available={available_count}); roles={day_roles}",
+            )
+
+    return True, "OK"
+
+
+def weekday_staff_metrics(
+    schedule: Dict[str, Dict[str, str]],
+    year: int,
+    month: int,
+    hols: Set[date],
+    roster: List[str],
+    cons: Constraints,
+    target: int = 5,
+) -> Dict[str, int]:
+    eligible_weekdays_checked = 0
+    eligible_days_with_target_or_more = 0
+    eligible_min_assigned_on_weekday: Optional[int] = None
+    eligible_deficit_sum_to_target = 0
+
+    for d in month_days(year, month):
+        if d in hols or not is_weekday(d):
+            continue
+        available_count = len(roster) - len(cons.hard_off.get(d, set()))
+        if available_count < target:
+            continue
+
+        eligible_weekdays_checked += 1
+        assigned_count = unique_assignee_count(schedule.get(d.isoformat(), {}))
+        if (
+            eligible_min_assigned_on_weekday is None
+            or assigned_count < eligible_min_assigned_on_weekday
+        ):
+            eligible_min_assigned_on_weekday = assigned_count
+        if assigned_count >= target:
+            eligible_days_with_target_or_more += 1
+        eligible_deficit_sum_to_target += max(0, target - assigned_count)
+
+    return {
+        "eligible_weekdays_checked": eligible_weekdays_checked,
+        "eligible_days_with_target_or_more": eligible_days_with_target_or_more,
+        "eligible_deficit_sum_to_target": eligible_deficit_sum_to_target,
+        "eligible_min_assigned_on_weekday": (
+            eligible_min_assigned_on_weekday if eligible_min_assigned_on_weekday is not None else 0
+        ),
+    }
+
+
+def validate_saturday_spread(
+    schedule: Dict[str, Dict[str, str]],
+    year: int,
+    month: int,
+    hols: Set[date],
+    roster: List[str],
+    max_spread: int = 1,
+) -> Tuple[bool, str]:
+    counts = saturday_work_counts(schedule, year, month, hols, roster)
+    spread = saturday_spread(counts)
+    msg = f"Saturday spread={spread}, counts={counts}"
+    return spread <= max_spread, msg
+
+
+def bu_deficit_metrics(
+    schedule: Dict[str, Dict[str, str]],
+    year: int,
+    month: int,
+    roster_size: int,
+) -> Dict[str, int]:
+    total_bu_missing = 0
+    bu2_bu3_missing = 0
+    bu3_missing = 0
+    tracked_roles = {"BU2", "BU3"}
+
+    for d in month_days(year, month):
+        day_roles = schedule.get(d.isoformat(), {})
+        for role in ideal_bu_roles_for_day(d, roster_size):
+            assigned = day_roles.get(role, "")
+            if not str(assigned).strip():
+                total_bu_missing += 1
+                if role in tracked_roles:
+                    bu2_bu3_missing += 1
+                if role == "BU3":
+                    bu3_missing += 1
+
+    return {
+        "total_bu_missing": total_bu_missing,
+        "bu2_bu3_missing": bu2_bu3_missing,
+        "bu3_missing": bu3_missing,
+    }
+
+
+def weekly_over40_events(
+    schedule: Dict[str, Dict[str, str]],
+    prev_sched: Dict[str, Dict[str, str]],
+    roster: List[str],
+    year: int,
+    month: int,
+) -> int:
+    events = 0
+    week_starts = sorted({week_start_sun(d) for d in month_days(year, month)})
+    for ws in week_starts:
+        relaxed = week_contains_push(ws) or week_contains_holiday(ws)
+        if relaxed:
+            continue
+        for person in roster:
+            total_hours = 0
+            for i in range(7):
+                dd = ws + timedelta(days=i)
+                total_hours += calculate_daily_hours(dd, person, schedule, prev_sched, year, month)
+            if total_hours > 40:
+                events += 1
+    return events
+
+
+def payperiod_over80_events(
+    schedule: Dict[str, Dict[str, str]],
+    prev_sched: Dict[str, Dict[str, str]],
+    roster: List[str],
+    payperiods: Optional[List[Tuple[date, date]]],
+    year: int,
+    month: int,
+) -> int:
+    if payperiods is None:
+        return 0
+
+    events = 0
+    for s, e in payperiods:
+        pp_relaxed = False
+        cur_wk = week_start_sun(s)
+        while cur_wk <= e:
+            if week_contains_push(cur_wk) or week_contains_holiday(cur_wk):
+                pp_relaxed = True
+                break
+            cur_wk += timedelta(days=7)
+
+        if pp_relaxed:
+            continue
+
+        for person in roster:
+            hours = 0
+            cur_day = s
+            while cur_day <= e:
+                hours += calculate_daily_hours(cur_day, person, schedule, prev_sched, year, month)
+                cur_day += timedelta(days=1)
+            if hours > 80:
+                events += 1
+
+    return events
+
+
+def validate_target_when_available(
+    schedule: Dict[str, Dict[str, str]],
+    year: int,
+    month: int,
+    roster: List[str],
+    cons: Constraints,
+    hols: Set[date],
+    target: int,
+) -> Tuple[bool, str]:
+    for d in month_days(year, month):
+        if d in hols or not is_weekday(d):
+            continue
+        available = len(roster) - len(cons.hard_off.get(d, set()))
+        if available >= target:
+            assigned_unique = unique_assignee_count(schedule.get(d.isoformat(), {}))
+            if assigned_unique < target:
+                return (
+                    False,
+                    f"Target weekday staffing missed on {d.isoformat()}: assigned {assigned_unique} < {target} "
+                    f"with {available} available; roles={schedule.get(d.isoformat(), {})}",
+                )
+    return True, "OK"
+
+
+def tight_day_diagnostics(
+    schedule: Dict[str, Dict[str, str]],
+    year: int,
+    month: int,
+    hols: Set[date],
+    roster: List[str],
+    cons: Constraints,
+    target: int,
+) -> List[str]:
+    lines: List[str] = []
+    for d in month_days(year, month):
+        if d in hols or not is_weekday(d):
+            continue
+        available_count = len(roster) - len(cons.hard_off.get(d, set()))
+        if available_count != target:
+            continue
+        day_key = d.isoformat()
+        roles = schedule.get(day_key, {})
+        assigned_unique = unique_assignee_count(roles)
+        if assigned_unique != target - 1:
+            continue
+        primaries = {k: v for k, v in roles.items() if k in ("PN", "AN", "W")}
+        lines.append(
+            f"TIGHT DAY {day_key}: available==target=={target}, assigned_unique={assigned_unique}; "
+            f"primaries={primaries}, missing 1 unique — typically requires BU1 to be filled; roles={roles}"
+        )
+    return lines
+
+
+# ----------------------------
+# Violations & Export
+# ----------------------------
+
+def audit_hours_caps(ws_vio, roster, week_starts, payperiods, schedule, prev_sched, year, month):
+    """Audit Weekly and Pay Period hour caps, respecting relaxations."""
+    
+    # 1. Weekly check
+    for ws_date in week_starts:
+        is_relaxed = week_contains_holiday(ws_date) or week_contains_push(ws_date)
+        if is_relaxed: continue
+        
+        for p in roster:
+            tot = 0
+            for i in range(7):
+                dd = ws_date + timedelta(days=i)
+                tot += calculate_daily_hours(dd, p, schedule, prev_sched, year, month)
+            if tot > 40:
+                ws_vio.append(["Weekly Cap Violation", p, f"{tot}h in week of {ws_date} (Limit 40)"])
+
+    # 2. PP Check
+    if payperiods:
+        for s, e in payperiods:
+            # Relax if PP contains ANY push or holiday week.
+            pp_relaxed = False
+            cur_wk = week_start_sun(s)
+            while cur_wk <= e:
+                if week_contains_push(cur_wk) or week_contains_holiday(cur_wk):
+                    pp_relaxed = True
+                    break
+                cur_wk += timedelta(days=7)
+            
+            if pp_relaxed: continue
+            
+            for p in roster:
+                h = 0
+                cur = s
+                while cur <= e:
+                    h += calculate_daily_hours(cur, p, schedule, prev_sched, year, month)
+                    cur += timedelta(days=1)
+                if h > 80:
+                    ws_vio.append(["PayPeriod Cap Violation", p, f"{h}h in PP {s}:{e} (Limit 80)"])
+
+
+def write_violations_tab(wb, schedule, year, month, roster, targets, cons, prev_sched, payperiods, hols, week_starts):
+    ws_vio = wb.create_sheet("Violations")
+    ws_vio["A1"] = "Rule Violations / Audits"
+    ws_vio["A1"].font = Font(bold=True, size=14)
+    ws_vio.append(["Type", "Person", "Details"])
+    for cell in ws_vio[2]: cell.font = Font(bold=True)
+
+    # 1. Target Audit
+    real_counts = {r: {p: 0 for p in roster} for r in ["PN", "AN", "W"]}
+    for d_iso, rmap in schedule.items():
+        for r in ["PN", "AN", "W"]:
+            p = rmap.get(r)
+            if p: real_counts[r][p] += 1
+    for p in roster:
+        for r in ["PN", "AN", "W"]:
+            tgt = targets[r][p]
+            act = real_counts[r][p]
+            if act != tgt:
+                ws_vio.append(["Target Mismatch", p, f"{r} Count {act} != Target {tgt}"])
+
+    # 2. Daily Constraints (Unified Loop)
+    sorted_dates = sorted(schedule.keys())
+    
+    for d_iso in sorted_dates:
+        d = date.fromisoformat(d_iso)
+        rmap = schedule[d_iso]
+        
+        roles_by_person = {} # p -> list of roles
+        hard_off_names = cons.hard_off.get(d, set())
+        
+        for r, p in rmap.items():
+            if p is None or str(p).strip() == "":
+                continue
+            roles_by_person.setdefault(p, []).append(r)
+
+            # B. Hard Off
+            if p in hard_off_names:
+                ws_vio.append(["Hard Off Violation", p, f"Worked {r} on {d} (Requested Off)"])
+            
+            # C. Avoid Role
+            avoid_list = cons.avoid_roles.get((d, r), set())
+            if p in avoid_list:
+                rtype = "Avoid Violation (Hard)" if r in ROLE_PRIMARY else "Avoid Warning (Soft)"
+                ws_vio.append([rtype, p, f"Assigned {r} on {d}"])
+                
+            # D. Back-to-Back (Same Role)
+            prev_d = d - timedelta(days=1)
+            prev_roles = schedule.get(prev_d.isoformat(), {})
+            if prev_d.month != month:
+                prev_roles = prev_sched.get(prev_d.isoformat(), {})
+            
+            if prev_roles.get(r) == p:
+                if r.startswith("BU"):
+                    ws_vio.append(["BU Rotation Warning", p, f"BU role repeated on consecutive days: {r} on {prev_d} and {d}"])
+                else:
+                    ws_vio.append(["Back-to-Back (Same Role)", p, f"Worked {r} on {prev_d} and {d}"])
+
+        # A. Duplicate Assignment (Aggregated)
+        for p, roles in roles_by_person.items():
+            if len(roles) > 1:
+                role_str = ", ".join(roles)
+                ws_vio.append(["Duplicate Assignment", p, f"Assigned {role_str} on {d}"])
+
+    # 3. Hours Audit
+    audit_hours_caps(ws_vio, roster, week_starts, payperiods, schedule, prev_sched, year, month)
+
+    # 4. Sunday Duplicate Audit
+    sunday_counts = {p: 0 for p in roster}
+    for d_iso, rmap in schedule.items():
+        d = date.fromisoformat(d_iso)
+        if is_sunday(d) and rmap.get("PN"):
+            sunday_counts[rmap["PN"]] += 1
+    for person, cnt in sunday_counts.items():
+        if cnt > 1:
+            ws_vio.append(["Sunday Duplicate", person, f"Assigned Sunday PN {cnt} times in {year}-{month:02d}"])
+
+
+def export_to_excel(schedule, year, month, out_path, roster, hols, prev_sched,
+                    payperiods, sales_order, cons, template_xlsx=None):
+    """Generates the Excel calendar. Can use a template or draw perfectly from scratch."""
+    import openpyxl
+    import calendar as _cal
+    from datetime import date as _date, timedelta as _td
+    from openpyxl.styles import PatternFill, Font, Alignment
+
+    # 1. Initialize Workbook (Template vs Scratch)
+    if template_xlsx:
+        wb = openpyxl.load_workbook(template_xlsx)
+        ws = wb.active
+        ws["B1"] = f"{_cal.month_name[month]} {year}"
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        
+        # --- REPLICATE TEMPLATE FORMATTING FROM SCRATCH ---
+        for col in range(2, 23):
+            ws.column_dimensions[get_column_letter(col)].width = 10
+        
+        for r in range(3, 51): 
+            ws.row_dimensions[r].height = 18
+            
+        ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=22)
+        c = ws.cell(1, 2, f"{_cal.month_name[month]} {year}")
+        c.font = FONT_HEADER
+        c.alignment = ALIGN_CENTER
+
+        # Draw Days of the Week headers
+        ws.row_dimensions[1].height = 30 # Title row
+        ws.row_dimensions[2].height = 20 # Header row
+
+        days_of_week = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        for i, day_name in enumerate(days_of_week):
+            col = SUN_START_COL + (i * DAY_WIDTH)
+
+            # Fix openpyxl missing borders on merged cells
+            for cc in range(col, col + DAY_WIDTH):
+                ws.cell(2, cc).border = THIN_BORDER
+
+            ws.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col + DAY_WIDTH - 1)
+            c = ws.cell(2, col, day_name)
+            c.font = Font(name="Calibri", size=14, bold=True)
+            c.alignment = ALIGN_CENTER
+
+    ws.title = _cal.month_name[month]
+    ws.sheet_view.showGridLines = False
+
+    first = _date(year, month, 1)
+    last = _date(year, month, _cal.monthrange(year, month)[1])
+    offset = weekday_sun0(first)
+    weeks = (offset + last.day + 6) // 7
+    grid_weeks = 6 if weeks > 5 else 5
+
+    white_fill = PatternFill("solid", fgColor=WHITE_FILL_HEX)
+    sunday_fill = PatternFill("solid", fgColor=SUNDAY_FILL)
+    nonmonth_fill = PatternFill("solid", fgColor=NONMONTH_FILL)
+
+    for wk in range(grid_weeks):
+        R = GRID_WEEK_START_ROW + WEEK_HEIGHT * wk
+        for dow in range(7):
+            col_start = SUN_START_COL + DAY_WIDTH * dow
+            day_num = (wk * 7 + dow) - offset + 1
+            in_month = (1 <= day_num <= last.day)
+
+            if in_month:
+                d = _date(year, month, day_num)
+                fill = sunday_fill if is_sunday(d) else white_fill
+            else:
+                d = None
+                fill = nonmonth_fill
+
+            for rr in range(R, R + WEEK_HEIGHT):
+                for cc in range(col_start, col_start + DAY_WIDTH):
+                    cell = ws.cell(rr, cc)
+                    cell.value = None
+                    cell.fill = fill
+                    if not template_xlsx:
+                        cell.font = FONT_MAIN
+                        cell.alignment = ALIGN_CENTER
+                        cell.border = THIN_BORDER
+
+            if not in_month:
+                continue
+
+            roles = schedule.get(d.isoformat(), {})
+
+            dn = ws.cell(R, col_start + 2, day_num)
+            dn.font = FONT_DAY_NUM
+            dn.alignment = Alignment(horizontal="right", vertical="top")
+
+            # Handle Holidays
+            if d in hols:
+                # Fix openpyxl missing borders on merged cells
+                if not template_xlsx:
+                    for rr in range(R, R + 8):
+                        for cc in range(col_start, col_start + 3):
+                            ws.cell(rr, cc).border = THIN_BORDER
+
+                ws.merge_cells(start_row=R, start_column=col_start, end_row=R+7, end_column=col_start+2)
+                c = ws.cell(R, col_start, "HOLIDAY")
+                c.alignment = ALIGN_CENTER
+                c.font = Font(bold=True, size=14)
+                continue
+
+            ws.cell(R + 1, col_start, "PN-")
+            if not is_sunday(d):
+                ws.cell(R + 2, col_start, "AN-")
+            if is_weekday(d):
+                ws.cell(R + 3, col_start, "W-")
+
+            ws.cell(R + 1, col_start + 1, roles.get("PN", ""))
+            if not is_sunday(d):
+                ws.cell(R + 2, col_start + 1, roles.get("AN", ""))
+            if is_weekday(d):
+                ws.cell(R + 3, col_start + 1, roles.get("W", ""))
+
+            if not is_sunday(d):
+                ws.cell(R + 4, col_start + 1, roles.get("BU1", ""))
+                ws.cell(R + 5, col_start + 1, roles.get("BU2", ""))
+                ws.cell(R + 6, col_start + 1, roles.get("BU3", ""))
+                ws.cell(R + 7, col_start + 1, roles.get("BU4", ""))
+
+    for nm in ["Weekly Hours", "Summary", "Pay Period Hours", "Violations"]:
+        if nm in wb.sheetnames:
+            del wb[nm]
+
+    ws_weekly = wb.create_sheet("Weekly Hours")
+    ws_weekly.sheet_view.showGridLines = False
+    ws_weekly["A1"] = "Weekly Hours (Sun-Sat)"
+    ws_weekly["A1"].font = Font(bold=True, size=14)
+    ws_weekly.append(["Week Start"] + roster)
+
+    week_starts = sorted({week_start_sun(d) for d in month_days(year, month)})
+    ot_fill = PatternFill("solid", fgColor=OVERTIME_FILL)
+    for ws_date in week_starts:
+        vals = []
+        for person in roster:
+            tot = 0
+            for i in range(7):
+                dd = ws_date + _td(days=i)
+                tot += calculate_daily_hours(dd, person, schedule, prev_sched, year, month)
+            vals.append(tot)
+        ws_weekly.append([ws_date.isoformat()] + vals)
+        r = ws_weekly.max_row
+        for i, v in enumerate(vals):
+            if v > 40:
+                ws_weekly.cell(row=r, column=2 + i).fill = ot_fill
+
+    ws2 = wb.create_sheet("Summary")
+    ws2["A1"] = "Summary"
+    ws2["A1"].font = Font(bold=True, size=14)
+    ws2.append(["Name"] + ROLE_PRIMARY + ROLE_BUS + ["Combined (PN+AN+W+BU1)", "Total", "Hours"])
+
+    for person in roster:
+        counts = {r: 0 for r in ROLE_PRIMARY + ROLE_BUS}
+        tot_hrs = 0
+        for d_iso, rmap in schedule.items():
+            for r, nm in rmap.items():
+                if nm == person:
+                    counts[r] += 1
+                    tot_hrs += hours_for_role(_date.fromisoformat(d_iso), r, hols)
+        combined_total = counts["PN"] + counts["AN"] + counts["W"] + counts["BU1"]
+        tot_ass = sum(counts[r] for r in ROLE_PRIMARY + ROLE_BUS)
+        ws2.append([person] + [counts[r] for r in ROLE_PRIMARY + ROLE_BUS] + [combined_total, tot_ass, tot_hrs])
+
+    if payperiods:
+        ws3 = wb.create_sheet("Pay Period Hours")
+        ws3.append(["Pay Period", "Start", "End"] + roster)
+        for i, (s, e) in enumerate(payperiods, 1):
+            row = [f"PP{i}", s.isoformat(), e.isoformat()]
+            for person in roster:
+                h = 0
+                cur = s
+                while cur <= e:
+                    h += calculate_daily_hours(cur, person, schedule, prev_sched, year, month)
+                    cur += _td(days=1)
+                row.append(h)
+            ws3.append(row)
+
+    targets, _, _ = compute_primary_targets(month_days(year, month), roster, sales_order, hols)
+    write_violations_tab(wb, schedule, year, month, roster, targets, cons,
+                         prev_sched, payperiods, hols, week_starts)
+    wb.save(out_path)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--month", required=True)
+    ap.add_argument("--timeoff-xlsx", default="FSA Schedule Info.xlsx")
+    ap.add_argument("--timeoff-sheet", default="FSA Schedule Info")
+    ap.add_argument("--prev-schedule", required=True)
+    ap.add_argument("--sales-sheet", default="Sales Ranking")
+    ap.add_argument("--roster-sheet", default="Roster")
+    ap.add_argument("--roster-json")
+    ap.add_argument("--payperiods-json")
+    ap.add_argument("--payperiod-anchor-start", default="2026-01-25")
+    ap.add_argument("--out-json")
+    ap.add_argument("--out-xlsx")
+    ap.add_argument("--template-xlsx", help="Blank month template .xlsx (preserve formatting; write values/fills)")
+    ap.add_argument("--seed", type=int, default=11)
+    ap.add_argument("--auto-seed", action="store_true", help="Try many seeds internally until staffing validator passes")
+    ap.add_argument("--seed-start", type=int, default=1)
+    ap.add_argument("--seed-end", type=int, default=50, help="Default 50 (caps attempts); increase if you want deeper search.")
+    ap.add_argument("--max-attempts", type=int, default=50, help="Default 50 (caps attempts); use with --seed-start to cap range.")
+    ap.add_argument("--auto-seed-verbose", action="store_true", help="Print each auto-seed attempt and failure reason")
+    ap.add_argument("--min-weekday-staff", type=int, default=4)
+    ap.add_argument("--target-weekday-staff", type=int, default=5)
+    ap.add_argument("--optimize-weekday-staff", action="store_true")
+    ap.add_argument("--weekday-target-repair", action="store_true",
+                    help="After BU fill, attempt BU-only micro-swaps within the same week to raise eligible weekdays to target staffing.")
+    ap.add_argument("--no-weekday-target-repair", action="store_true",
+                    help="Disable automatic weekday target repair even during auto-seed enforcement.")
+    ap.add_argument("--primary-swap-repair", action="store_true",
+                    help="Allow like-for-like primary swaps (PN/AN/W) across dates to free weekly capacity so a missing BU slot can be filled on an eligible weekday.")
+    ap.add_argument("--weekday-target-repair-verbose", action="store_true")
+    ap.add_argument("--enforce-target-when-available", action="store_true")
+    ap.add_argument("--no-enforce-target-when-available", action="store_true")
+    args = ap.parse_args()
+
+    stop_event = threading.Event()
+    hb_thread = None
+    enable_heartbeat = False
+    if args.auto_seed:
+        seed_start_hb = args.seed_start
+        seed_end_hb = args.seed_end
+        seed_end_overridden_hb = any(
+            a == "--seed-end" or a.startswith("--seed-end=")
+            for a in sys.argv[1:]
+        )
+        max_attempts_overridden_hb = any(
+            a == "--max-attempts" or a.startswith("--max-attempts=")
+            for a in sys.argv[1:]
+        )
+        if max_attempts_overridden_hb:
+            if not seed_end_overridden_hb:
+                seed_end_hb = seed_start_hb + args.max_attempts - 1
+            else:
+                seed_end_hb = min(seed_end_hb, seed_start_hb + args.max_attempts - 1)
+        resolved_seed_range_size = max(0, seed_end_hb - seed_start_hb + 1)
+        enable_heartbeat = (resolved_seed_range_size >= 25)
+
+    if enable_heartbeat:
+        def heartbeat() -> None:
+            while not stop_event.is_set():
+                print('.', end='', file=sys.stderr, flush=True)
+                stop_event.wait(3.0)
+
+        hb_thread = threading.Thread(target=heartbeat, daemon=True)
+        hb_thread.start()
+
+    try:
+        year, month = parse_month_arg(args.month)
+        target_weekday_staff_overridden = any(
+            a == "--target-weekday-staff" or a.startswith("--target-weekday-staff=")
+            for a in sys.argv[1:]
+        )
+        min_weekday_staff_overridden = any(
+            a == "--min-weekday-staff" or a.startswith("--min-weekday-staff=")
+            for a in sys.argv[1:]
+        )
+        wb = openpyxl.load_workbook(args.timeoff_xlsx, data_only=True)
+        try:
+            month_sheet = f"{calendar.month_name[month]} Requests"
+            if args.timeoff_sheet in wb.sheetnames:
+                resolved_timeoff_sheet = args.timeoff_sheet
+            elif month_sheet in wb.sheetnames:
+                resolved_timeoff_sheet = month_sheet
+            else:
+                raise ValueError(
+                    f"Missing timeoff sheet names: '{args.timeoff_sheet}' and '{month_sheet}'. "
+                    "Expected the default sheet or month request sheet pattern '<Month> Requests' (e.g., 'March Requests')."
+                )
+
+            if args.roster_json:
+                roster = load_roster_from_json(args.roster_json)
+            else:
+                roster_ws = wb[args.roster_sheet] if args.roster_sheet in wb.sheetnames else None
+                roster = load_roster_from_ws(roster_ws, year, month) if roster_ws is not None else None
+                if roster is None:
+                    roster = DEFAULT_ROSTER[:]
+
+            timeoff = load_timeoff_from_ws(wb[resolved_timeoff_sheet])
+            sales_ws = wb[args.sales_sheet] if args.sales_sheet in wb.sheetnames else None
+            if sales_ws is None:
+                raise ValueError(f"Missing sheet '{args.sales_sheet}'")
+            sales = load_sales_ranking_from_ws(sales_ws, year, month, roster)
+        finally:
+            wb.close()
+        if not target_weekday_staff_overridden:
+            if len(roster) < 4:
+                args.target_weekday_staff = len(roster)
+            else:
+                args.target_weekday_staff = min(5, max(4, len(roster) - 1))
+        if not min_weekday_staff_overridden:
+            args.min_weekday_staff = default_min_weekday_staff(len(roster))
+
+        weekday_repair_explicit = any(a == "--weekday-target-repair" for a in sys.argv[1:])
+        if args.auto_seed:
+            enforce_target = True
+            if args.no_enforce_target_when_available:
+                enforce_target = False
+            elif args.enforce_target_when_available:
+                enforce_target = True
+            # else: keep default True
+
+            if enforce_target and (not weekday_repair_explicit) and (not args.no_weekday_target_repair):
+                args.weekday_target_repair = True
+
+        cons = compile_constraints(timeoff, roster)
+        prev = load_schedule_json(args.prev_schedule)
+        if args.payperiods_json:
+            pps = load_payperiods_from_json(args.payperiods_json)
+        else:
+            ms = date(year, month, 1)
+            me = date(year, month, calendar.monthrange(year, month)[1])
+            anc = datetime.strptime(args.payperiod_anchor_start, "%Y-%m-%d").date()
+            raw = generate_payperiods(anc, ms - timedelta(days=28), me + timedelta(days=28))
+            pps = [p for p in raw if p[0] <= me and p[1] >= ms]
+        hols = observed_holidays_for_year(year)
+        if not args.auto_seed:
+            cfg = BuildConfig(
+                year,
+                month,
+                roster,
+                sales,
+                rng_seed=args.seed,
+                enable_weekday_target_repair=args.weekday_target_repair,
+                enable_primary_swap_repair=args.primary_swap_repair,
+                weekday_target_repair_verbose=args.weekday_target_repair_verbose,
+                target_weekday_staff=args.target_weekday_staff,
+                min_weekday_staff=args.min_weekday_staff,
+            )
+            sched = build_schedule(cfg, prev, cons, pps)
+        else:
+            seed_start = args.seed_start
+            seed_end = args.seed_end
+            seed_end_overridden = any(
+                a == "--seed-end" or a.startswith("--seed-end=")
+                for a in sys.argv[1:]
+            )
+            max_attempts_overridden = any(
+                a == "--max-attempts" or a.startswith("--max-attempts=")
+                for a in sys.argv[1:]
+            )
+
+            if max_attempts_overridden:
+                if not seed_end_overridden:
+                    seed_end = seed_start + args.max_attempts - 1
+                else:
+                    seed_end = min(seed_end, seed_start + args.max_attempts - 1)
+
+            if args.auto_seed and enforce_target and (not seed_end_overridden) and (not max_attempts_overridden):
+                seed_end = max(seed_end, seed_start + 399)
+
+            # Guard: prevent empty seed range (e.g., --seed-start > --seed-end)
+            if seed_start > seed_end:
+                raise ValueError("Resolved seed range is empty: ensure --seed-start <= --seed-end")
+
+            for d in month_days(year, month):
+                if d in hols or not is_weekday(d):
+                    continue
+                available_count = len(roster) - len(cons.hard_off.get(d, set()))
+                required_roles = roles_required_for_day(d, hols)
+                requires_w = "W" in required_roles
+                if available_count < 2:
+                    raise RuntimeError(
+                        f"Impossible staffing on {d.isoformat()}: only {available_count} counselors available due to hard-off requests; need at least 2 for PN/AN."
+                    )
+                if requires_w and available_count < 3:
+                    raise RuntimeError(
+                        f"Impossible staffing on {d.isoformat()}: only {available_count} counselors available due to hard-off requests; need at least 3 when W is required."
+                    )
+
+            sched = None
+            winning_seed = None
+            winning_metrics = None
+            winning_bu_metrics = None
+            winning_weekly_over40 = None
+            winning_payperiod_over80 = None
+            best_score = None
+            last_failure_reason = "No seeds attempted"
+            last_tight_day_lines: List[str] = []
+
+            total_required_target_days = 0
+            for d in month_days(year, month):
+                if d in hols or not is_weekday(d):
+                    continue
+                available_count = len(roster) - len(cons.hard_off.get(d, set()))
+                if available_count >= args.target_weekday_staff:
+                    total_required_target_days += 1
+
+            for seed in range(seed_start, seed_end + 1):
+                perfect_found = False
+                cfg = BuildConfig(
+                    year,
+                    month,
+                    roster,
+                    sales,
+                    rng_seed=seed,
+                    enable_weekday_target_repair=args.weekday_target_repair,
+                    enable_primary_swap_repair=args.primary_swap_repair,
+                    weekday_target_repair_verbose=args.weekday_target_repair_verbose,
+                    target_weekday_staff=args.target_weekday_staff,
+                    min_weekday_staff=args.min_weekday_staff,
+                )
+                if args.auto_seed_verbose:
+                    print(f"Trying seed {seed}")
+                try:
+                    if args.auto_seed_verbose:
+                        candidate = build_schedule(cfg, prev, cons, pps)
+                    else:
+                        buf = io.StringIO()
+                        with contextlib.redirect_stdout(buf):
+                            candidate = build_schedule(cfg, prev, cons, pps)
+                except Exception as e:
+                    last_failure_reason = f"Seed {seed} failed to solve: {e}"
+                    if args.auto_seed_verbose:
+                        print(last_failure_reason, flush=True)
+                    continue
+
+                ok, reason = validate_min_weekday_staff(
+                    candidate,
+                    year,
+                    month,
+                    hols,
+                    roster,
+                    cons,
+                    min_staff=args.min_weekday_staff,
+                )
+                if not ok:
+                    last_failure_reason = f"Seed {seed} failed validator: {reason}"
+                    tight_lines = tight_day_diagnostics(
+                        candidate,
+                        year,
+                        month,
+                        hols,
+                        roster,
+                        cons,
+                        min(args.min_weekday_staff, args.target_weekday_staff),
+                    )
+                    last_tight_day_lines = tight_lines
+                    if tight_lines:
+                        last_failure_reason += f" | {tight_lines[0]}"
+                    if args.auto_seed_verbose:
+                        print(last_failure_reason, flush=True)
+                        for line in tight_lines[:5]:
+                            print(f"[tight-day] {line}")
+                    continue
+
+                if enforce_target:
+                    ok_target, reason_target = validate_target_when_available(
+                        candidate,
+                        year,
+                        month,
+                        roster,
+                        cons,
+                        hols,
+                        args.target_weekday_staff,
+                    )
+                    if not ok_target:
+                        last_failure_reason = f"Seed {seed} failed validator: {reason_target}"
+                        tight_lines = tight_day_diagnostics(
+                            candidate,
+                            year,
+                            month,
+                            hols,
+                            roster,
+                            cons,
+                            args.target_weekday_staff,
+                        )
+                        last_tight_day_lines = tight_lines
+                        if tight_lines:
+                            last_failure_reason += f" | {tight_lines[0]}"
+                        if args.auto_seed_verbose:
+                            print(last_failure_reason, flush=True)
+                            for line in tight_lines[:5]:
+                                print(f"[tight-day] {line}")
+                        continue
+
+                metrics = weekday_staff_metrics(
+                    candidate,
+                    year,
+                    month,
+                    hols,
+                    roster,
+                    cons,
+                    target=args.target_weekday_staff,
+                )
+
+                if not args.optimize_weekday_staff:
+                    sched = candidate
+                    winning_seed = seed
+                    winning_metrics = metrics
+                    break
+
+                bu_metrics = bu_deficit_metrics(candidate, year, month, len(roster))
+                wk_over40 = weekly_over40_events(candidate, prev, roster, year, month)
+                pp_over80 = payperiod_over80_events(candidate, prev, roster, pps, year, month)
+                sat_spread = saturday_spread(saturday_work_counts(candidate, year, month, hols, roster))
+
+                score = (
+                    metrics["eligible_days_with_target_or_more"],
+                    -metrics["eligible_deficit_sum_to_target"],
+                    -sat_spread,
+                    -bu_metrics["bu2_bu3_missing"],
+                    -bu_metrics["total_bu_missing"],
+                    -wk_over40,
+                    -pp_over80,
+                )
+                if best_score is None or score > best_score:
+                    best_score = score
+                    sched = candidate
+                    winning_seed = seed
+                    winning_metrics = metrics
+                    winning_bu_metrics = bu_metrics
+                    winning_weekly_over40 = wk_over40
+                    winning_payperiod_over80 = pp_over80
+
+                met_required_target_days = 0
+                for d in month_days(year, month):
+                    if d in hols or not is_weekday(d):
+                        continue
+                    available_count = len(roster) - len(cons.hard_off.get(d, set()))
+                    if available_count < args.target_weekday_staff:
+                        continue
+                    assigned_count = unique_assignee_count(candidate.get(d.isoformat(), {}))
+                    if assigned_count >= args.target_weekday_staff:
+                        met_required_target_days += 1
+
+                if enforce_target and met_required_target_days == total_required_target_days:
+                    perfect_found = True
+
+                if perfect_found:
+                    break
+
+            if sched is None:
+                final_tight_lines = last_tight_day_lines[:]
+                hint = (
+                    "Hint: enforcement requires reaching target unique staffing on eligible weekdays; "
+                    "a 4th unique person typically comes from BU1. Try --weekday-target-repair and/or "
+                    "increase --seed-end. "
+                    f"Resolved: weekday_target_repair={args.weekday_target_repair}, "
+                    f"seed_range=[{seed_start}, {seed_end}], enforce_target={enforce_target}"
+                )
+                tight_suffix = ""
+                if final_tight_lines:
+                    tight_suffix = " Tight days: " + " | ".join(final_tight_lines[:5])
+                raise RuntimeError(
+                    f"Auto-seed failed for range [{seed_start}, {seed_end}] with "
+                    f"target_weekday_staff={args.target_weekday_staff}, "
+                    f"enforce_target_when_available={enforce_target}. "
+                    f"Last failure: {last_failure_reason}. {hint}{tight_suffix}"
+                )
+
+            print(f"✅ Auto-seed success: seed={winning_seed}")
+            if args.optimize_weekday_staff and winning_metrics is not None:
+                if winning_metrics["eligible_weekdays_checked"] == 0:
+                    print(
+                        f"Weekday staffing: no eligible weekdays for target={args.target_weekday_staff} "
+                        f"this month (availability <{args.target_weekday_staff} on all weekdays)."
+                    )
+                else:
+                    print(
+                        f"Weekday staffing: {winning_metrics['eligible_days_with_target_or_more']}/"
+                        f"{winning_metrics['eligible_weekdays_checked']} eligible weekdays meet "
+                        f"target={args.target_weekday_staff}, min eligible weekday assigned="
+                        f"{winning_metrics['eligible_min_assigned_on_weekday']}"
+                    )
+                if winning_bu_metrics is not None:
+                    print(
+                        "BU deficits: "
+                        f"BU2/BU3 missing={winning_bu_metrics['bu2_bu3_missing']}, "
+                        f"total BU missing={winning_bu_metrics['total_bu_missing']}"
+                    )
+                if winning_weekly_over40 is not None and winning_payperiod_over80 is not None:
+                    print(
+                        "Hours over caps (non-relaxed): "
+                        f"weekly>40 events={winning_weekly_over40}, "
+                        f"payperiod>80 events={winning_payperiod_over80}"
+                    )
+
+        oj = args.out_json or str(Path(args.prev_schedule).with_name(f"{year}_{month:02d}_schedule.json"))
+        ox = args.out_xlsx or str(Path(args.prev_schedule).with_name(f"{calendar.month_name[month]}_{year}_Schedule.xlsx"))
+
+        sat_ok, sat_msg = validate_saturday_spread(sched, year, month, hols, roster)
+        sat_status = "OK" if sat_ok else "INFO"
+        print(f"Saturday spread ({sat_status}): {sat_msg}")
+
+        Path(oj).write_text(json.dumps(sched, indent=2), "utf-8")
+        print(f"✅ JSON: {oj}")
+
+        export_to_excel(
+            sched, year, month, ox, roster, hols,
+            prev, pps, sales, cons, template_xlsx=args.template_xlsx
+        )
+        print(f"✅ Excel: {ox}")
+    finally:
+        stop_event.set()
+        if hb_thread is not None:
+            hb_thread.join(timeout=1.0)
+            print('', file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
