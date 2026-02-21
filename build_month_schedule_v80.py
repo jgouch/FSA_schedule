@@ -389,69 +389,70 @@ def load_timeoff_from_xlsx(xlsx_path: str, sheet_name: str) -> List[TimeOffRule]
     try:
         if sheet_name not in wb.sheetnames:
             raise ValueError(f"Missing timeoff sheet '{sheet_name}'")
-        ws = wb[sheet_name]
-
-        headers = {}
-        for c in range(1, ws.max_column + 1):
-            v = ws.cell(1, c).value
-            if v:
-                headers[_normalize_header_key(v)] = c
-
-        c_name = headers.get("name")
-        if not c_name:
-            raise ValueError("TimeOff sheet missing 'Name' column")
-        c_date = headers.get("date")
-        c_start = headers.get("start")
-        c_end = headers.get("end")
-        c_hard = headers.get("hard")
-        c_avoid = headers.get("avoidroles")
-
-        def parse_hard(v) -> bool:
-            if v is None or str(v).strip() == "": return True
-            return str(v).strip().lower() in ("true", "1", "yes", "y")
-
-        rules = []
-        for r in range(2, ws.max_row + 1):
-            nv = ws.cell(r, c_name).value
-            if not nv: continue
-            name = norm_name(nv)
-
-            dates = []
-            dv = ws.cell(r, c_date).value if c_date else None
-            sv = ws.cell(r, c_start).value if c_start else None
-            ev = ws.cell(r, c_end).value if c_end else None
-
-            if dv:
-                dates = [parse_excel_date(dv)]
-            elif sv and ev:
-                sd = parse_excel_date(sv)
-                ed = parse_excel_date(ev)
-                if ed < sd:
-                    raise ValueError(f"Invalid time-off range for {name}: start {sd} is after end {ed}")
-                cur = sd
-                while cur <= ed:
-                    dates.append(cur)
-                    cur += timedelta(days=1)
-            else:
-                continue
-
-            hard = parse_hard(ws.cell(r, c_hard).value) if c_hard else True
-            av = set()
-            if c_avoid:
-                val = ws.cell(r, c_avoid).value
-                if val:
-                    av = {p.strip().upper() for p in str(val).split(",") if p.strip()}
-                    invalid = av - set(ROLE_PRIMARY + ROLE_BUS)
-                    if invalid:
-                        raise ValueError(
-                            f"Unknown role(s) in AvoidRoles for {name} on row {r}: {sorted(invalid)}"
-                        )
-
-            for d in dates:
-                rules.append(TimeOffRule(name, d, hard, av))
-        return rules
+        return load_timeoff_from_ws(wb[sheet_name])
     finally:
         wb.close()
+
+def load_timeoff_from_ws(ws) -> List[TimeOffRule]:
+    headers = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(1, c).value
+        if v:
+            headers[_normalize_header_key(v)] = c
+
+    c_name = headers.get("name")
+    if not c_name:
+        raise ValueError("TimeOff sheet missing 'Name' column")
+    c_date = headers.get("date")
+    c_start = headers.get("start")
+    c_end = headers.get("end")
+    c_hard = headers.get("hard")
+    c_avoid = headers.get("avoidroles")
+
+    def parse_hard(v) -> bool:
+        if v is None or str(v).strip() == "": return True
+        return str(v).strip().lower() in ("true", "1", "yes", "y")
+
+    rules = []
+    for r in range(2, ws.max_row + 1):
+        nv = ws.cell(r, c_name).value
+        if not nv: continue
+        name = norm_name(nv)
+
+        dates = []
+        dv = ws.cell(r, c_date).value if c_date else None
+        sv = ws.cell(r, c_start).value if c_start else None
+        ev = ws.cell(r, c_end).value if c_end else None
+
+        if dv:
+            dates = [parse_excel_date(dv)]
+        elif sv and ev:
+            sd = parse_excel_date(sv)
+            ed = parse_excel_date(ev)
+            if ed < sd:
+                raise ValueError(f"Invalid time-off range for {name}: start {sd} is after end {ed}")
+            cur = sd
+            while cur <= ed:
+                dates.append(cur)
+                cur += timedelta(days=1)
+        else:
+            continue
+
+        hard = parse_hard(ws.cell(r, c_hard).value) if c_hard else True
+        av = set()
+        if c_avoid:
+            val = ws.cell(r, c_avoid).value
+            if val:
+                av = {p.strip().upper() for p in str(val).split(",") if p.strip()}
+                invalid = av - set(ROLE_PRIMARY + ROLE_BUS)
+                if invalid:
+                    raise ValueError(
+                        f"Unknown role(s) in AvoidRoles for {name} on row {r}: {sorted(invalid)}"
+                    )
+
+        for d in dates:
+            rules.append(TimeOffRule(name, d, hard, av))
+    return rules
 
 def load_roster_from_json(path: str) -> List[str]:
     data = json.loads(Path(path).read_text("utf-8"))
@@ -473,75 +474,76 @@ def load_roster_from_timeoff_xlsx(
     try:
         if sheet_name not in wb.sheetnames:
             return None
-
-        ws = wb[sheet_name]
-        headers = {}
-        for c in range(1, ws.max_column + 1):
-            v = ws.cell(1, c).value
-            if v:
-                headers[_normalize_header_key(v)] = c
-
-        c_name = headers.get("name")
-        if not c_name:
-            raise ValueError(f"Roster sheet '{sheet_name}' missing required 'Name' column")
-
-        c_active = headers.get("active")
-        if c_active is None:
-            c_active = headers.get("status")
-        c_start = headers.get("start")
-        c_end = headers.get("end")
-
-        month_start = date(year, month, 1)
-        month_end = date(year, month, calendar.monthrange(year, month)[1])
-
-        def parse_active(v) -> bool:
-            if v is None:
-                return True
-            s = str(v).strip()
-            if s == "":
-                return True
-            u = s.upper()
-            if u in {"Y", "YES", "TRUE", "1"}:
-                return True
-            if u in {"N", "NO", "FALSE", "0"}:
-                return False
-            return True
-
-        roster: List[str] = []
-        seen: Set[str] = set()
-        for r in range(2, ws.max_row + 1):
-            nv = ws.cell(r, c_name).value
-            if nv is None or str(nv).strip() == "":
-                continue
-            name = norm_name(nv)
-            if not name:
-                continue
-
-            is_active = parse_active(ws.cell(r, c_active).value) if c_active else True
-            if not is_active:
-                continue
-
-            sv = ws.cell(r, c_start).value if c_start else None
-            ev = ws.cell(r, c_end).value if c_end else None
-            sd = parse_excel_date(sv) if sv not in (None, "") else None
-            ed = parse_excel_date(ev) if ev not in (None, "") else None
-
-            if sd and sd > month_end:
-                continue
-            if ed and ed < month_start:
-                continue
-
-            if name not in seen:
-                seen.add(name)
-                roster.append(name)
-
-        if not roster:
-            raise ValueError(
-                f"Roster sheet '{sheet_name}' exists but contains zero active roster names for {year}-{month:02d}"
-            )
-        return roster
+        return load_roster_from_ws(wb[sheet_name], year, month)
     finally:
         wb.close()
+
+def load_roster_from_ws(ws, year: int, month: int) -> Optional[List[str]]:
+    headers = {}
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(1, c).value
+        if v:
+            headers[_normalize_header_key(v)] = c
+
+    c_name = headers.get("name")
+    if not c_name:
+        raise ValueError(f"Roster sheet '{ws.title}' missing required 'Name' column")
+
+    c_active = headers.get("active")
+    if c_active is None:
+        c_active = headers.get("status")
+    c_start = headers.get("start")
+    c_end = headers.get("end")
+
+    month_start = date(year, month, 1)
+    month_end = date(year, month, calendar.monthrange(year, month)[1])
+
+    def parse_active(v) -> bool:
+        if v is None:
+            return True
+        s = str(v).strip()
+        if s == "":
+            return True
+        u = s.upper()
+        if u in {"Y", "YES", "TRUE", "1"}:
+            return True
+        if u in {"N", "NO", "FALSE", "0"}:
+            return False
+        return True
+
+    roster: List[str] = []
+    seen: Set[str] = set()
+    for r in range(2, ws.max_row + 1):
+        nv = ws.cell(r, c_name).value
+        if nv is None or str(nv).strip() == "":
+            continue
+        name = norm_name(nv)
+        if not name:
+            continue
+
+        is_active = parse_active(ws.cell(r, c_active).value) if c_active else True
+        if not is_active:
+            continue
+
+        sv = ws.cell(r, c_start).value if c_start else None
+        ev = ws.cell(r, c_end).value if c_end else None
+        sd = parse_excel_date(sv) if sv not in (None, "") else None
+        ed = parse_excel_date(ev) if ev not in (None, "") else None
+
+        if sd and sd > month_end:
+            continue
+        if ed and ed < month_start:
+            continue
+
+        if name not in seen:
+            seen.add(name)
+            roster.append(name)
+
+    if not roster:
+        raise ValueError(
+            f"Roster sheet '{ws.title}' exists but contains zero active roster names for {year}-{month:02d}"
+        )
+    return roster
 
 def load_payperiods_from_json(path: str) -> List[Tuple[date, date]]:
     data = json.loads(Path(path).read_text("utf-8"))
@@ -566,69 +568,71 @@ def load_sales_ranking_from_timeoff_xlsx(xlsx_path, sheet_name, year, month, ros
     try:
         if sheet_name not in wb.sheetnames:
             raise ValueError(f"Missing sheet '{sheet_name}'")
-        ws = wb[sheet_name]
-        cutoff = date(year, month, 1) - timedelta(days=1)
-        parsed_rows = []
-        fallback_rows = []
-        for r in range(2, ws.max_row + 1):
-            p = ws.cell(r, 1).value
-            if not p:
-                continue
-            ranks = []
-            for c in range(2, ws.max_column + 1):
-                v = ws.cell(r, c).value
-                if v and str(v).strip():
-                    ranks.append(norm_name(v))
-            if not ranks:
-                continue
-
-            fallback_rows.append((r, p, ranks))
-
-            period_end: Optional[date] = None
-            try:
-                pd = parse_excel_date(p)
-                period_end = date(pd.year, pd.month, calendar.monthrange(pd.year, pd.month)[1])
-            except Exception:
-                s = str(p).strip()
-                qm = re.match(r"^(\d{4})\s*Q([1-4])$", s, flags=re.IGNORECASE)
-                if qm:
-                    qy = int(qm.group(1))
-                    qn = int(qm.group(2))
-                    q_end_month = qn * 3
-                    period_end = date(qy, q_end_month, calendar.monthrange(qy, q_end_month)[1])
-                else:
-                    mm = re.match(r"^(\d{4})-(\d{2})$", s)
-                    if mm:
-                        my = int(mm.group(1))
-                        mmn = int(mm.group(2))
-                        if 1 <= mmn <= 12:
-                            period_end = date(my, mmn, calendar.monthrange(my, mmn)[1])
-
-            if period_end is not None:
-                parsed_rows.append((period_end, r, ranks))
-
-        order = None
-        closed_rows = [item for item in parsed_rows if item[0] <= cutoff]
-        if closed_rows:
-            closed_rows.sort(key=lambda t: (t[0], t[1]))
-            order = closed_rows[-1][2]
-        elif parsed_rows:
-            parsed_rows.sort(key=lambda t: (t[0], t[1]))
-            order = parsed_rows[-1][2]
-        elif fallback_rows:
-            order = fallback_rows[-1][2]
-
-        roster_set = set(roster_names)
-        if not order:
-            return [n for n in SENIORITY_ORDER if n in roster_set] + [n for n in roster_names if n not in SENIORITY_ORDER]
-
-        order = [x for x in order if x in roster_set]
-        for p in roster_names:
-            if p in roster_set and p not in order:
-                order.append(p)
-        return order
+        return load_sales_ranking_from_ws(wb[sheet_name], year, month, roster_names)
     finally:
         wb.close()
+
+def load_sales_ranking_from_ws(ws, year, month, roster_names):
+    cutoff = date(year, month, 1) - timedelta(days=1)
+    parsed_rows = []
+    fallback_rows = []
+    for r in range(2, ws.max_row + 1):
+        p = ws.cell(r, 1).value
+        if not p:
+            continue
+        ranks = []
+        for c in range(2, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if v and str(v).strip():
+                ranks.append(norm_name(v))
+        if not ranks:
+            continue
+
+        fallback_rows.append((r, p, ranks))
+
+        period_end: Optional[date] = None
+        try:
+            pd = parse_excel_date(p)
+            period_end = date(pd.year, pd.month, calendar.monthrange(pd.year, pd.month)[1])
+        except Exception:
+            s = str(p).strip()
+            qm = re.match(r"^(\d{4})\s*Q([1-4])$", s, flags=re.IGNORECASE)
+            if qm:
+                qy = int(qm.group(1))
+                qn = int(qm.group(2))
+                q_end_month = qn * 3
+                period_end = date(qy, q_end_month, calendar.monthrange(qy, q_end_month)[1])
+            else:
+                mm = re.match(r"^(\d{4})-(\d{2})$", s)
+                if mm:
+                    my = int(mm.group(1))
+                    mmn = int(mm.group(2))
+                    if 1 <= mmn <= 12:
+                        period_end = date(my, mmn, calendar.monthrange(my, mmn)[1])
+
+        if period_end is not None:
+            parsed_rows.append((period_end, r, ranks))
+
+    order = None
+    closed_rows = [item for item in parsed_rows if item[0] <= cutoff]
+    if closed_rows:
+        closed_rows.sort(key=lambda t: (t[0], t[1]))
+        order = closed_rows[-1][2]
+    elif parsed_rows:
+        parsed_rows.sort(key=lambda t: (t[0], t[1]))
+        order = parsed_rows[-1][2]
+    elif fallback_rows:
+        order = fallback_rows[-1][2]
+
+    roster_set = set(roster_names)
+    if not order:
+        return [n for n in SENIORITY_ORDER if n in roster_set] + [n for n in roster_names if n not in SENIORITY_ORDER]
+
+    order = [x for x in order if x in roster_set]
+    for p in roster_names:
+        if p in roster_set and p not in order:
+            order.append(p)
+    return order
 
 def load_schedule_json(path: str) -> Dict[str, Dict[str, str]]:
     data = json.loads(Path(path).read_text("utf-8"))
@@ -2570,6 +2574,8 @@ def write_violations_tab(wb, schedule, year, month, roster, targets, cons, prev_
         hard_off_names = cons.hard_off.get(d, set())
         
         for r, p in rmap.items():
+            if p is None or str(p).strip() == "":
+                continue
             roles_by_person.setdefault(p, []).append(r)
 
             # B. Hard Off
@@ -2789,6 +2795,29 @@ def main():
     ap.add_argument("--no-enforce-target-when-available", action="store_true")
     args = ap.parse_args()
 
+    timeoff_sheet_overridden = any(
+        a == "--timeoff-sheet" or a.startswith("--timeoff-sheet=")
+        for a in sys.argv[1:]
+    )
+
+    year, month = parse_month_arg(args.month)
+    month_sheet = f"{calendar.month_name[month]} Requests"
+    if not timeoff_sheet_overridden:
+        args.timeoff_sheet = month_sheet
+
+    seed_end_overridden = any(
+        a == "--seed-end" or a.startswith("--seed-end=")
+        for a in sys.argv[1:]
+    )
+    max_attempts_overridden = any(
+        a == "--max-attempts" or a.startswith("--max-attempts=")
+        for a in sys.argv[1:]
+    )
+    enable_heartbeat = args.auto_seed or (
+        (seed_end_overridden or max_attempts_overridden)
+        and (args.seed_end - args.seed_start >= 25)
+    )
+
     stop_event = threading.Event()
 
     def heartbeat() -> None:
@@ -2796,11 +2825,12 @@ def main():
             print('.', end='', file=sys.stderr, flush=True)
             stop_event.wait(3.0)
 
-    hb_thread = threading.Thread(target=heartbeat, daemon=True)
-    hb_thread.start()
+    hb_thread = None
+    if enable_heartbeat:
+        hb_thread = threading.Thread(target=heartbeat, daemon=True)
+        hb_thread.start()
 
     try:
-        year, month = parse_month_arg(args.month)
         target_weekday_staff_overridden = any(
             a == "--target-weekday-staff" or a.startswith("--target-weekday-staff=")
             for a in sys.argv[1:]
@@ -2809,17 +2839,35 @@ def main():
             a == "--min-weekday-staff" or a.startswith("--min-weekday-staff=")
             for a in sys.argv[1:]
         )
-        if args.roster_json:
-            roster = load_roster_from_json(args.roster_json)
-        else:
-            roster = load_roster_from_timeoff_xlsx(
-                args.timeoff_xlsx,
-                args.roster_sheet,
-                year,
-                month,
-            )
-            if roster is None:
-                roster = DEFAULT_ROSTER[:]
+        wb_timeoff = openpyxl.load_workbook(args.timeoff_xlsx, data_only=True)
+        try:
+            if args.timeoff_sheet in wb_timeoff.sheetnames:
+                resolved_timeoff_sheet = args.timeoff_sheet
+            elif month_sheet in wb_timeoff.sheetnames:
+                resolved_timeoff_sheet = month_sheet
+            else:
+                raise ValueError(
+                    f"Missing timeoff sheet names: '{args.timeoff_sheet}' and '{month_sheet}'. "
+                    "Expected the default sheet or month request sheet pattern '<Month> Requests' (e.g., 'March Requests')."
+                )
+
+            if args.roster_json:
+                roster = load_roster_from_json(args.roster_json)
+            else:
+                if args.roster_sheet not in wb_timeoff.sheetnames:
+                    roster = None
+                else:
+                    roster = load_roster_from_ws(wb_timeoff[args.roster_sheet], year, month)
+                if roster is None:
+                    roster = DEFAULT_ROSTER[:]
+
+            timeoff = load_timeoff_from_ws(wb_timeoff[resolved_timeoff_sheet])
+            if args.sales_sheet not in wb_timeoff.sheetnames:
+                raise ValueError(f"Missing sheet '{args.sales_sheet}'")
+            sales = load_sales_ranking_from_ws(wb_timeoff[args.sales_sheet], year, month, roster)
+        finally:
+            wb_timeoff.close()
+
         if not target_weekday_staff_overridden:
             if len(roster) < 4:
                 args.target_weekday_staff = len(roster)
@@ -2832,7 +2880,7 @@ def main():
             enforce_target = True
             if args.no_enforce_target_when_available:
                 enforce_target = False
-            if args.enforce_target_when_available:
+            elif args.enforce_target_when_available:
                 enforce_target = True
         else:
             enforce_target = args.enforce_target_when_available
@@ -2841,24 +2889,7 @@ def main():
         if args.auto_seed and enforce_target and (not weekday_repair_explicit) and (not args.no_weekday_target_repair):
             args.weekday_target_repair = True
 
-        wb_for_sheet = openpyxl.load_workbook(args.timeoff_xlsx, data_only=True)
-        try:
-            month_sheet = f"{calendar.month_name[month]} Requests"
-            if args.timeoff_sheet in wb_for_sheet.sheetnames:
-                resolved_timeoff_sheet = args.timeoff_sheet
-            elif month_sheet in wb_for_sheet.sheetnames:
-                resolved_timeoff_sheet = month_sheet
-            else:
-                raise ValueError(
-                    f"Missing timeoff sheet names: '{args.timeoff_sheet}' and '{month_sheet}'. "
-                    "Expected the default sheet or month request sheet pattern '<Month> Requests' (e.g., 'March Requests')."
-                )
-        finally:
-            wb_for_sheet.close()
-
-        timeoff = load_timeoff_from_xlsx(args.timeoff_xlsx, resolved_timeoff_sheet)
         cons = compile_constraints(timeoff)
-        sales = load_sales_ranking_from_timeoff_xlsx(args.timeoff_xlsx, args.sales_sheet, year, month, roster)
         prev = load_schedule_json(args.prev_schedule)
         if args.payperiods_json:
             pps = load_payperiods_from_json(args.payperiods_json)
@@ -2889,15 +2920,6 @@ def main():
         else:
             seed_start = args.seed_start
             seed_end = args.seed_end
-            seed_end_overridden = any(
-                a == "--seed-end" or a.startswith("--seed-end=")
-                for a in sys.argv[1:]
-            )
-            max_attempts_overridden = any(
-                a == "--max-attempts" or a.startswith("--max-attempts=")
-                for a in sys.argv[1:]
-            )
-
             if max_attempts_overridden:
                 if not seed_end_overridden:
                     seed_end = seed_start + args.max_attempts - 1
@@ -3151,8 +3173,9 @@ def main():
         print(f"✅ Excel: {ox}")
     finally:
         stop_event.set()
-        hb_thread.join(timeout=1.0)
-        print('', file=sys.stderr)
+        if hb_thread is not None:
+            hb_thread.join(timeout=1.0)
+            print('', file=sys.stderr)
 
 
 if __name__ == "__main__":
