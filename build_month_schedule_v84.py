@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_month_schedule_v84.py
+build_month_schedule_v85.py
 
 End-to-end month builder:
 - Reads FSA Schedule Info.xlsx (monthly request sheet + Sales Ranking tab)
@@ -22,7 +22,8 @@ LOCKED CALENDAR GEOMETRY:
     BU3 name: (mid, R+6)
     BU4 name (push-week Saturday only): (mid, R+7)
 
-Logic Changes (v84):
+Logic Changes (v85):
+- FIX (v85): Actually delete cache clears inside auto-seed loop for massive speedup; fix missing borders and heights on dynamically generated Day headers.
 - FIX (v84): Fix missing borders on Holiday merged cells in template fallback; add flush=True to verbose auto-seed prints to prevent terminal stutter.
 - FIX (v83): Graceful template fallback now includes Day of Week headers; filter out ghost employees in constraints; remove cache destruction in auto-seed loop.
 - FIX (v82): Graceful fallback to draw the calendar grid from scratch if no template is provided.
@@ -2621,14 +2622,21 @@ def export_to_excel(schedule, year, month, out_path, roster, hols, prev_sched,
         c.alignment = ALIGN_CENTER
 
         # Draw Days of the Week headers
+        ws.row_dimensions[1].height = 30 # Title row
+        ws.row_dimensions[2].height = 20 # Header row
+
         days_of_week = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
         for i, day_name in enumerate(days_of_week):
             col = SUN_START_COL + (i * DAY_WIDTH)
+
+            # Fix openpyxl missing borders on merged cells
+            for cc in range(col, col + DAY_WIDTH):
+                ws.cell(2, cc).border = THIN_BORDER
+
             ws.merge_cells(start_row=2, start_column=col, end_row=2, end_column=col + DAY_WIDTH - 1)
             c = ws.cell(2, col, day_name)
             c.font = Font(name="Calibri", size=14, bold=True)
             c.alignment = ALIGN_CENTER
-            c.border = THIN_BORDER
 
     ws.title = _cal.month_name[month]
     ws.sheet_view.showGridLines = False
@@ -2885,9 +2893,6 @@ def main():
             pps = [p for p in raw if p[0] <= me and p[1] >= ms]
         hols = observed_holidays_for_year(year)
         if not args.auto_seed:
-            _week_push_cache.clear()
-            _week_hol_cache.clear()
-            _push_days_cache.clear()
             cfg = BuildConfig(
                 year,
                 month,
