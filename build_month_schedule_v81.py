@@ -2882,8 +2882,7 @@ def main():
                 enforce_target = False
             elif args.enforce_target_when_available:
                 enforce_target = True
-        else:
-            enforce_target = args.enforce_target_when_available
+            # else: keep default True
 
         weekday_repair_explicit = any(a == "--weekday-target-repair" for a in sys.argv[1:])
         if args.auto_seed and enforce_target and (not weekday_repair_explicit) and (not args.no_weekday_target_repair):
